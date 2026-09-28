@@ -34,6 +34,8 @@ AUDIO_JOBS = queue.Queue()
 VOICE_PAUSED = threading.Event()
 VOICE_TARGET: tuple[str, str | None] | None = None
 OPENCODE_LOCK = threading.Lock()
+CLAUDE_LOCK = threading.Lock()
+CLAUDE_SESSION_PREFIX = "claude-code-session-id"
 SEEN_LOCK = threading.Lock()
 STATE_DIR = Path("/home/kevin/.local/state/agent0-slack-listener")
 SESSION_FILE = STATE_DIR / "opencode-session-id"
@@ -41,6 +43,10 @@ SEEN_FILE = STATE_DIR / "processed-slack-events"
 OPENCODE_URL = os.environ.get("AGENT0_OPENCODE_URL", "http://127.0.0.1:4096")
 OWNER_USER_ID = os.environ.get("SLACK_OWNER_USER_ID", "U0C3D8T0LE6")
 SEEN_EVENTS: set[str] = set()
+CONFIRM_CODE = "area 51"
+PENDING_ACTION_TTL = 300
+PENDING_ACTIONS: dict[tuple[str, str], tuple[float, str, bool]] = {}
+PENDING_ACTIONS_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -152,6 +158,49 @@ def opencode_session(directory: str | None = None) -> str:
     return session_id
 
 
+def _claude_session_file(directory: str | None) -> Path:
+    if not directory:
+        return STATE_DIR / CLAUDE_SESSION_PREFIX
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", directory.strip("/"))
+    return STATE_DIR / f"{CLAUDE_SESSION_PREFIX}.{safe}"
+
+
+def _claude_once(
+    prompt: str,
+    directory: str | None,
+    permission_flags: list[str],
+    resume: str | None,
+) -> tuple[str, str | None]:
+    # Confirmed against Claude Code 2.1.282: --output-format json uses
+    # result and session_id. Bash scopes as Bash(git *), not a bare Bash.
+    cmd = [
+        os.environ.get("AGENT0_CLAUDE_BIN", "claude"),
+        "-p", prompt,
+        "--output-format", "json",
+        "--permission-prompts", "none",
+        *permission_flags,
+    ]
+    if resume:
+        cmd.extend(["--resume", resume])
+    proc = subprocess.run(
+        cmd,
+        cwd=directory or None,
+        capture_output=True,
+        text=True,
+        timeout=150,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"claude -p failed (exit {proc.returncode}): {proc.stderr.strip()[:500]}")
+    payload = json.loads(proc.stdout)
+    if payload.get("is_error"):
+        raise RuntimeError(f"claude -p error: {str(payload.get('result') or '')[:500]}")
+    answer = str(payload.get("result") or "").strip()
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        session_id = None
+    return answer, session_id
+
+
 def agent0_reply(message: str, action: bool = False, channel: str | None = None) -> str:
     # Shared ground truth the reasoning model would otherwise lack
     # (it has no repo or workstation context of its own).
@@ -164,41 +213,99 @@ def agent0_reply(message: str, action: bool = False, channel: str | None = None)
     )
     if action:
         prompt = (
-            "You are Agent0, Scrum Master for Rooted/OwnPlace, handling an explicit action authorized "
-            "by project owner Kevin in the lab channel. Carry out only the stated instruction using tools "
-            "when needed. Do not expand its scope. Never expose or change credentials. Do not deploy, "
-            "perform destructive operations, or merge/publish unless the instruction explicitly requests "
-            "that exact gated operation. Start with ACTED, BLOCKED, or NEEDS-OWNER. State concise evidence "
-            "of what happened and finish with 'End turn.' "
-            f"Context: {context} Authorized owner instruction: {message}"
+            "You are Agent0, Scrum Master for Rooted/OwnPlace, doing meeting work. "
+            "The instruction comes from owner Kevin, or from Claude the consultant "
+            "under Kevin's standing authorization for review and PR-open work. Do the stated "
+            "work with tools now: reviewing code, reporting findings, and opening PRs from "
+            "branches are expected. Hard nos — refuse with NEEDS-OWNER: merging anything, "
+            "pushing to main, deploying, credentials, destructive operations. Start with ACTED "
+            "only if a file or git state changed. If you only answered and changed nothing, "
+            "start with ANSWERED. Use BLOCKED or NEEDS-OWNER when you refuse. Then concise evidence, max 6 sentences. Never write "
+            "'bridge acknowledgement', 'timestamp report', or 'End turn'. "
+            f"Context: {context} Meeting work order: {message}"
         )
-        agent = "build"
+        permission_flags = [
+            "--permission-mode", "acceptEdits",
+            "--allowedTools", "Read Edit Write Bash(git *) Bash(npm *) Bash(npx *)",
+        ]
     else:
         prompt = (
             "You are Agent0, Scrum Master for Rooted/OwnPlace, replying in a live lab meeting. "
             "Kevin is owner; AgentGPT is CIO consultant; Radics is coder and organization owner. "
             "This turn is discussion-only: do not call tools or modify files, GitHub, credentials, "
-            "deployments, or configuration. Give a direct useful answer. Start with one status label: "
-            "DISCUSSION-ONLY, BLOCKED, or NEEDS-OWNER. Finish with 'End turn.' "
+            "deployments, or configuration. Reply naturally in at most 4 sentences. "
+            "Do not prefix with any status label and do not end with 'End turn'. "
+            "Do not repeat back what was said; add something new: an answer, "
+            "a decision, or a question. Banned phrases — never write them: "
+            "'bridge acknowledgement', 'timestamp report', 'no file changes', "
+            "'no merges or deploys', 'workstation'. "
             f"Context: {context} Meeting turn: {message}"
         )
-        agent = "summary"
-    with OPENCODE_LOCK:
-        session_id = opencode_session(project_directory(channel))
-        result = json_request(
-            "POST", f"{OPENCODE_URL}/session/{session_id}/message",
-            {
-                "parts": [{"type": "text", "text": prompt}],
-                "model": {"providerID": "opencode", "modelID": "gpt-5.6-luna"},
-                "agent": agent,
-            },
-            timeout=150,
-        )
-    texts = [part.get("text", "") for part in result.get("parts", []) if part.get("type") == "text"]
-    answer = "\n".join(texts).strip()
+        permission_flags = [
+            "--permission-mode", "dontAsk",
+            "--allowedTools", "Read Grep Glob",
+            "--disallowedTools", "Bash Edit Write",
+        ]
+    directory = project_directory(channel)
+    session_file = _claude_session_file(directory)
+    resume = session_file.read_text(encoding="utf-8").strip() if session_file.exists() else ""
+    with CLAUDE_LOCK:
+        try:
+            answer, new_id = _claude_once(prompt, directory, permission_flags, resume or None)
+        except Exception:
+            if not resume:
+                raise
+            LOG.warning("Stored Claude session failed; retrying without resume")
+            answer, new_id = _claude_once(prompt, directory, permission_flags, None)
+        if new_id:
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.write_text(new_id + "\n", encoding="utf-8")
     if not answer:
         raise RuntimeError("Agent0 reasoning returned no text")
     return answer
+
+
+def _prune_pending_actions(now: float) -> None:
+    expired = [key for key, (deadline, _, _) in PENDING_ACTIONS.items() if deadline <= now]
+    for key in expired:
+        PENDING_ACTIONS.pop(key, None)
+
+
+def request_action_confirmation(settings: Settings, channel: str, thread_ts: str | None,
+                                instruction: str, action: bool) -> None:
+    key = (channel, thread_ts or "")
+    with PENDING_ACTIONS_LOCK:
+        _prune_pending_actions(time.monotonic())
+        PENDING_ACTIONS[key] = (time.monotonic() + PENDING_ACTION_TTL, instruction, action)
+    post_message(
+        settings,
+        channel,
+        "Confirmation required. Reply in this thread with @Agent0 Area 51 within five minutes to authorize this action. Nothing has been acted on yet.",
+        thread_ts=thread_ts,
+    )
+
+
+def confirm_pending_action(settings: Settings, channel: str, thread_ts: str | None,
+                           user: str | None) -> bool:
+    if user != OWNER_USER_ID:
+        post_message(settings, channel, "NEEDS-OWNER: only Kevin can confirm an Agent0 action.", thread_ts=thread_ts)
+        return False
+    key = (channel, thread_ts or "")
+    now = time.monotonic()
+    with PENDING_ACTIONS_LOCK:
+        _prune_pending_actions(now)
+        pending = PENDING_ACTIONS.pop(key, None)
+    if pending is None:
+        post_message(settings, channel, "No pending Agent0 action matched this confirmation.", thread_ts=thread_ts)
+        return False
+    _, instruction, action = pending
+    threading.Thread(
+        target=route_agent0_turn,
+        args=(settings, channel, thread_ts, instruction, action),
+        name="agent0-confirmed-reasoning",
+        daemon=True,
+    ).start()
+    return True
 
 
 def post_message(settings: Settings, channel: str, text: str, thread_ts: str | None = None,
@@ -227,6 +334,7 @@ def speak_text(text: str, voice: str = "agent0") -> bool:
     models = {
         "agent0": "/home/kevin/.local/share/agent0-slack-listener/voices/en_US-amy-low/en_US-amy-low.onnx",
         "codex": "/home/kevin/.local/share/agent0-slack-listener/voices/en_US-ryan-low/en_US-ryan-low.onnx",
+        "claude": "/home/kevin/.local/share/agent0-slack-listener/voices/en_GB-alan-low/en_GB-alan-low.onnx",
     }
     model = models.get(voice, models["agent0"])
     if os.path.exists(piper) and os.path.exists(model):
@@ -503,6 +611,21 @@ def deliver_response(settings: Settings, channel: str, thread_ts: str | None,
         post_message(settings, channel, reply, thread_ts=thread_ts, broadcast=broadcast)
 
 
+def queue_demo_license(settings: Settings, channel: str, thread_ts: str | None) -> None:
+    question = (
+        "Kevin, what should Agent0 work on next? Reply in this thread with @Agent0 and your request. "
+        "I will ask for the Area 51 confirmation before doing anything."
+    )
+    post_message(settings, channel, question, thread_ts=thread_ts)
+    AUDIO_JOBS.put((settings, channel, thread_ts, "", question, "agent0"))
+
+
+def queue_demo_standup(settings: Settings, channel: str, thread_ts: str | None) -> None:
+    post_message(settings, channel, "Stand-up demo queued: Agent0, Claude, then AgentGPT.", thread_ts=thread_ts)
+    for voice, spoken in DEMO_STANDUP_LINES:
+        AUDIO_JOBS.put((settings, channel, thread_ts, "", spoken, voice))
+
+
 def audio_worker(settings: Settings) -> None:
     # One worker owns recording and playback so neither can overlap the other.
     LOG.info("Voice standby active: waiting for break in")
@@ -527,6 +650,9 @@ def audio_worker(settings: Settings) -> None:
             if STOP:
                 break
             if not heard and not complete and not AUDIO_JOBS.empty():
+                continue
+            if heard and complete and re.search(r"\bdemo\s*stand[\s-]*up\b", heard, flags=re.IGNORECASE):
+                queue_demo_standup(settings, target[0], target[1])
                 continue
             if heard and complete and addressed_party(heard) == "Agent0":
                 thread_ts = target[1]
@@ -671,7 +797,7 @@ def is_builtin_command(message: str) -> bool:
     return (
         not lower
         or lower in {"help", "?", "voice", "voice status", "voice pause", "mic off", "voice resume", "mic on"}
-        or lower.startswith(("@here ", "say ", "codex say ", "agentgpt say ", "listen", "hear", "demo", "status", "ping", "standup", "blocker"))
+        or lower.startswith(("@here ", "say ", "codex say ", "agentgpt say ", "listen", "hear", "demo", "status", "ping", "standup", "blocker", "ask "))
     )
 
 
@@ -682,6 +808,8 @@ def audit_line(message: str, answer: str) -> str:
     upper = first.upper()
     if upper.startswith("ACTED"):
         outcome = "executed"
+    elif upper.startswith("ANSWERED"):
+        outcome = "answered"
     elif upper.startswith(("BLOCKED", "NEEDS-OWNER")):
         outcome = "blocked"
     else:
@@ -689,6 +817,28 @@ def audit_line(message: str, answer: str) -> str:
     heard = message if len(message) <= 120 else message[:117] + "..."
     why = first if len(first) <= 160 else first[:157] + "..."
     return f'Bridge audit: heard="{heard}" → reasoning → {outcome}: {why}'
+
+
+def relabel_unproven_acted(directory: str | None, answer: str) -> str:
+    """ACTED is allowed only when git shows a change. Otherwise the label is ANSWERED."""
+    lines = answer.splitlines() or [""]
+    if not lines[0].upper().startswith("ACTED"):
+        return answer
+    changed = False
+    if directory:
+        try:
+            r = subprocess.run(
+                ["git", "-C", directory, "status", "--porcelain"],
+                capture_output=True, text=True, timeout=20,
+            )
+            changed = r.returncode == 0 and any(ln.strip() for ln in r.stdout.splitlines())
+        except Exception:
+            changed = False
+    if changed:
+        return answer
+    rest = lines[0][5:].lstrip(" :")
+    lines[0] = f"ANSWERED: {rest}" if rest else "ANSWERED"
+    return "\n".join(lines)
 
 
 def verify_action(directory: str | None, answer: str) -> str:
@@ -721,8 +871,12 @@ def route_agent0_turn(settings: Settings, channel: str, thread_ts: str | None, m
     try:
         directory = project_directory(channel)
         answer = agent0_reply(message, action=action, channel=channel)
+        if action:
+            answer = relabel_unproven_acted(directory, answer)
         check = verify_action(directory, answer) if action else ""
-        reply = answer + ("\n" + check if check else "") + "\n" + audit_line(message, answer)
+        reply = answer + ("\n" + check if check else "")
+        if action:
+            reply += "\n" + audit_line(message, answer)
         AUDIO_JOBS.put((settings, channel, thread_ts, reply, answer, "agent0", True))
     except Exception as exc:
         LOG.exception("Agent0 reasoning handoff failed")
@@ -752,6 +906,18 @@ def handle_event(settings: Settings, payload: dict[str, Any]) -> None:
     text = clean_mention_text(event.get("text", ""), settings.bot_user_id)
     LOG.info("Handled app mention in %s with command=%r", channel, text)
     lower = text.lower().strip()
+    thread_ts = event.get("thread_ts") or event.get("ts")
+    if lower == CONFIRM_CODE:
+        confirm_pending_action(settings, channel, thread_ts, event.get("user"))
+        return
+    if lower.startswith("ask "):
+        thread_ts = event.get("thread_ts") or event.get("ts")
+        reply, spoken = ask_consultants(settings, channel, thread_ts, text[4:].strip())
+        if spoken:
+            AUDIO_JOBS.put((settings, channel, thread_ts, reply, spoken, "agent0"))
+        else:
+            post_message(settings, channel, reply, thread_ts=thread_ts)
+        return
     if lower in {"voice pause", "mic off"}:
         VOICE_PAUSED.set()
         post_message(settings, channel, "Microphone standby paused.", thread_ts=event.get("ts"))
@@ -761,19 +927,35 @@ def handle_event(settings: Settings, payload: dict[str, Any]) -> None:
         VOICE_PAUSED.clear()
         post_message(settings, channel, "Ready for break in. Wait for the beep, then speak and finish with end turn.", thread_ts=event.get("ts"))
         return
+    if lower in {"demo license", "demo authorize"}:
+        queue_demo_license(settings, channel, thread_ts)
+        return
+    if lower in {"demo standup", "demo stand-up"}:
+        queue_demo_standup(settings, channel, thread_ts)
+        return
     if not is_builtin_command(text):
         thread_ts = event.get("thread_ts") or event.get("ts")
-        action_requested = lower.startswith("act:")
+        explicit_act = lower.startswith("act:")
+        # Meeting mode: the owner's @mentions are work orders, not chat.
+        # AGENT0_MEETING_MODE=action enables it; anything else keeps the old
+        # explicit act: prefix. Bots and non-owners can never trigger action.
+        meeting_action = (
+            os.environ.get("AGENT0_MEETING_MODE", "gated").lower() == "action"
+            and event.get("user") == OWNER_USER_ID
+        )
+        action_requested = explicit_act or meeting_action
         if action_requested and event.get("user") != OWNER_USER_ID:
             answer = "NEEDS-OWNER: Only Kevin can authorize an Agent0 action. Nothing was acted on. End turn."
             AUDIO_JOBS.put((settings, channel, thread_ts, answer, answer, "agent0"))
             return
-        instruction = text[4:].strip() if action_requested else text
-        status = "owner-authorized action" if action_requested else "discussion-only"
-        post_message(settings, channel, f"Agent0 received the turn and is thinking. Status: {status}.", thread_ts=thread_ts)
+        instruction = text[4:].strip() if explicit_act else text
+        if action_requested:
+            request_action_confirmation(settings, channel, thread_ts, instruction, True)
+            return
+        post_message(settings, channel, "Agent0 received the turn and is thinking. Status: discussion-only.", thread_ts=thread_ts)
         threading.Thread(
             target=route_agent0_turn,
-            args=(settings, channel, thread_ts, instruction, action_requested),
+            args=(settings, channel, thread_ts, instruction, False),
             name="agent0-reasoning",
             daemon=True,
         ).start()
@@ -795,6 +977,218 @@ def open_socket(settings: Settings) -> str:
     if not result.get("ok"):
         raise RuntimeError(f"apps.connections.open failed: {result.get('error')}")
     return result["url"]
+
+
+CLAUDE_USER_ID = os.environ.get("CLAUDE_USER_ID", "U0C4BBDGA1F")
+CHATGPT_USER_ID = os.environ.get("CHATGPT_USER_ID", "U0C3H3GKFB6")
+CONSULT_USERS = {
+    CLAUDE_USER_ID: "Claude",
+    CHATGPT_USER_ID: "ChatGPT",
+}
+CONSULT_WATCH_FILE = STATE_DIR / "consult-watch.json"
+DEMO_STANDUP_LINES = [
+    (
+        "agent0",
+        "Agent zero. Good morning. Yesterday we merged M ten follow model broadcast and closed the milestone. "
+        "The web now merges local followed porches and labels every entry by origin. Today we are proving "
+        "the voice bridge with Claude Code and three distinct agent voices.",
+    ),
+    (
+        "claude",
+        "Claude. On the code side, the important property is fail closed isolation. Every porch is verified "
+        "independently, so a tampered package is skipped without breaking the merge. Sealed posts stay sealed, "
+        "and no unsigned timeline data reaches display.",
+    ),
+    (
+        "codex",
+        "Agent G P T. Product view: this is portable audience infrastructure, not a recommendation feed. "
+        "People follow porches they already choose. There is no stranger discovery and no engagement ranking.",
+    ),
+    (
+        "agent0",
+        "Agent zero. No open pull requests and no merge blocker. Owner actions now pause for a five minute confirmation code before tools run. Decision needed from Kevin: should the next milestone prioritize remote porch fetching, or finish and harden the live voice demo first? End stand-up.",
+    ),
+]
+
+
+def owner_user_token() -> str:
+    return os.environ.get("SLACK_USER_TOKEN", "").strip()
+
+
+def post_as_owner(channel: str, text: str, thread_ts: str | None = None) -> dict[str, Any]:
+    token = owner_user_token()
+    if not token:
+        return {"ok": False, "error": "no_user_token"}
+    payload: dict[str, Any] = {"channel": channel, "text": text}
+    if thread_ts:
+        payload["thread_ts"] = thread_ts
+    return slack_api("chat.postMessage", token, payload)
+
+
+def ask_consultants(settings: Settings, channel: str, thread_ts: str | None,
+                    rest: str) -> tuple[str, str | None]:
+    """Ping Claude/ChatGPT as the owner so their Slack apps actually wake.
+
+    Those apps ignore bot_id messages. A user-token post looks like Kevin.
+    """
+    lower = rest.lower().strip()
+    who = "both"
+    question = rest.strip()
+    for prefix in ("both ", "claude ", "chatgpt ", "agentgpt "):
+        if lower.startswith(prefix):
+            who = prefix.strip()
+            question = rest[len(prefix):].strip()
+            break
+    if not question:
+        return "Send `ask claude <question>`, `ask chatgpt <question>`, or `ask both <question>`.", None
+    if who == "agentgpt":
+        who = "chatgpt"
+    if not owner_user_token():
+        return (
+            "NEEDS-OWNER: Claude and ChatGPT ignore bot mentions. Add SLACK_USER_TOKEN "
+            "(your Slack user OAuth token, xoxp-) to ~/.config/agent0-slack/env, then restart "
+            "agent0-slack-listener. Nothing was pinged.",
+            None,
+        )
+    targets: list[tuple[str, str]] = []
+    if who in {"claude", "both"}:
+        targets.append(("Claude", CLAUDE_USER_ID))
+    if who in {"chatgpt", "both"}:
+        targets.append(("ChatGPT", CHATGPT_USER_ID))
+    asked: list[str] = []
+    failed: list[str] = []
+    for name, uid in targets:
+        result = post_as_owner(channel, f"<@{uid}> {question}", thread_ts)
+        if result.get("ok"):
+            asked.append(name)
+        else:
+            failed.append(f"{name}:{result.get('error')}")
+    if asked and not failed:
+        spoken = "Asked " + " and ".join(asked) + " as you."
+        return spoken, spoken
+    if asked:
+        reply = f"Asked {', '.join(asked)}. Failed: {', '.join(failed)}."
+        return reply, "Partial consult send."
+    return f"Ask failed: {', '.join(failed)}.", None
+
+
+def _consult_history(token: str, channel: str) -> list[dict[str, Any]]:
+    url = f"https://slack.com/api/conversations.history?channel={channel}&limit=5"
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        data = json.load(response)
+    if not data.get("ok"):
+        return []
+    messages = sorted(data.get("messages", []), key=lambda m: float(m.get("ts", 0) or 0))
+    candidates: list[dict[str, Any]] = []
+    for parent in messages:
+        parent = dict(parent)
+        parent["_channel"] = channel
+        candidates.append(parent)
+        if parent.get("reply_count"):
+            try:
+                turl = (
+                    "https://slack.com/api/conversations.replies"
+                    f"?channel={channel}&ts={parent.get('ts')}&limit=15"
+                )
+                treq = urllib.request.Request(turl, headers={"Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(treq, timeout=30) as tresponse:
+                    tdata = json.load(tresponse)
+                if tdata.get("ok"):
+                    for child in tdata.get("messages", []):
+                        child = dict(child)
+                        child["_channel"] = channel
+                        candidates.append(child)
+            except Exception as exc:
+                LOG.warning("Consultant watcher thread fetch failed: %s", exc)
+    return candidates
+
+
+def consultant_watcher(settings: Settings) -> None:
+    """Follow Claude/ChatGPT posts without a human relay.
+
+    Their Slack apps ignore bot mentions. Once a human (or user-token) ping
+    wakes them, this poller closes the return leg on lab + standup.
+    Loop-safe: only CONSULT_USERS trigger, never our own posts, and
+    auto-replies never @mention them.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        marks = json.loads(CONSULT_WATCH_FILE.read_text(encoding="utf-8"))
+        watermarks = {str(k): float(v) for k, v in marks.items()}
+    except (OSError, ValueError, json.JSONDecodeError):
+        watermarks = {}
+        legacy = STATE_DIR / "claude-watch-ts"
+        try:
+            watermarks[settings.lab_channel] = float(legacy.read_text(encoding="utf-8").strip() or 0)
+        except (OSError, ValueError):
+            pass
+    initialized = {ch: watermarks.get(ch, 0) > 0 for ch in settings.allowed_channels}
+    while not STOP:
+        try:
+            time.sleep(25)
+            if STOP:
+                break
+            for channel in sorted(settings.allowed_channels):
+                candidates = _consult_history(settings.bot_token, channel)
+                candidates.sort(key=lambda m: float(m.get("ts", 0) or 0))
+                last_ts = watermarks.get(channel, 0.0)
+                if not initialized.get(channel):
+                    if candidates:
+                        try:
+                            last_ts = float(candidates[-1].get("ts", 0) or 0)
+                        except ValueError:
+                            pass
+                        watermarks[channel] = last_ts
+                        CONSULT_WATCH_FILE.write_text(json.dumps(watermarks) + "\n", encoding="utf-8")
+                    initialized[channel] = True
+                    continue
+                for message in candidates:
+                    ts = message.get("ts", "")
+                    try:
+                        fts = float(ts)
+                    except ValueError:
+                        continue
+                    if fts <= last_ts:
+                        continue
+                    last_ts = fts
+                    watermarks[channel] = last_ts
+                    CONSULT_WATCH_FILE.write_text(json.dumps(watermarks) + "\n", encoding="utf-8")
+                    uid = message.get("user")
+                    name = CONSULT_USERS.get(uid or "")
+                    if not name:
+                        continue
+                    if not claim_event(f"consult:{uid}:{ts}"):
+                        continue
+                    text = (message.get("text") or "").strip()[:1500]
+                    if not text:
+                        continue
+                    substance = "\n".join(
+                        ln for ln in text.splitlines()
+                        if "claude.com/product/tag" not in ln
+                        and "Using the legacy Claude in Slack bot" not in ln
+                    ).strip()
+                    if name == "Claude" and len(substance) < 50:
+                        LOG.info("Consultant follow: skipping notice-only %s post %s", name, ts)
+                        continue
+                    if not substance:
+                        continue
+                    wants_agent0 = bool(re.search(r"\bagent\s*0\b|\bagentzero\b", substance, flags=re.IGNORECASE))
+                    wants_work = bool(re.search(
+                        r"\breport\b|\breview\b|\bopen\b|\bpr\b|\bcheck\b|\blook\b|\bfix\b"
+                        r"|\bmake\b|\bdraft\b|\blist\b|\bsummar",
+                        substance, flags=re.IGNORECASE))
+                    is_order = wants_agent0 and wants_work
+                    LOG.info("Consultant follow: %s post %s, routing %s turn", name, ts, "ACTION" if is_order else "discussion")
+                    voice = "claude" if name == "Claude" else "codex"
+                    AUDIO_JOBS.put((settings, channel, ts, "", f"{name}. {substance}", voice))
+                    route_agent0_turn(
+                        settings, channel, ts,
+                        f"{name} posted (auto-follow, no human mention needed): {substance}",
+                        is_order,
+                    )
+        except Exception as exc:
+            LOG.warning("Consultant watcher failed: %s", exc)
 
 
 def run(settings: Settings) -> None:
@@ -860,6 +1254,7 @@ def main() -> int:
         return 0 if connection.get("ok") else 1
 
     threading.Thread(target=audio_worker, args=(settings,), name="agent0-audio", daemon=True).start()
+    threading.Thread(target=consultant_watcher, args=(settings,), name="agent0-consult-watch", daemon=True).start()
     run(settings)
     return 0
 
