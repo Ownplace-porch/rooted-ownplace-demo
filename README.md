@@ -1,6 +1,6 @@
 # Rooted / OwnPlace Demo
 
-This is the smallest runnable Rooted proof: a creator bot publishes one Kinfolk story package to two independent local-folder simulations, and OwnPlace renders both copies. The storage provider is replaceable; the protocol package is shared.
+This is the smallest runnable Rooted proof: two Kinfolk, each with their own key and their own simulated cloud, follow each other, and OwnPlace renders each porch. The storage provider is replaceable; the protocol package is shared.
 
 ## Run
 
@@ -13,7 +13,7 @@ npm run web
 npm test
 ```
 
-Open the URL printed by Vite (normally `http://localhost:5173`). The publish command writes `demo/stores/nextcloud-sim` and `demo/stores/google-drive-sim` identically.
+Open the URL printed by Vite (normally `http://localhost:5173`). The publish command seeds two Kinfolk: Alex on `demo/stores/nextcloud-sim` and Sam on `demo/stores/google-drive-sim`, each with one signed story and following the other. `npm run verify` checks each porch on its own. Post as Sam with `npm run post -- --title T --body B --author-id kinfolk-sam`; the web composer posts as Alex.
 
 Write API auth: set `OWNPLACE_WRITE_TOKEN`; on HTTPS deploys also set `COOKIE_SECURE=1` so session cookies require TLS.
 
@@ -32,10 +32,10 @@ New packages use persistent Ed25519 Kinfolk identities. The publisher stores pri
 
 - `packages/protocol`: Kinfolk, story, manifest, signature types and canonical hashing.
 - `packages/storage`: `ObjectStore` and `LocalFolderStore`, with WebDAV and Google Drive scaffolds.
-- `packages/timeline`: shared story-package build, verified index read/rebuild, and syndication to every backend.
+- `packages/timeline`: shared story-package build, verified index read/rebuild, follows, and publishing to the author's own porch.
 - `apps/creator-bot`: sample package publisher.
-- `apps/client-sims`: headless Kinfolk clients that verify both stores (hashes, signature, cross-backend match).
-- `apps/ownplace-web`: Vite/React reader for both simulations.
+- `apps/client-sims`: headless Kinfolk clients that verify each porch on its own (hashes, signatures, owner key, pinned follows).
+- `apps/ownplace-web`: Vite/React reader, one column per Kinfolk porch.
 - `apps/voice-bridge`: Python Slack Socket Mode listener bridging push-to-talk meeting turns to OpenCode reasoning.
 - `docs/architecture.md`: data flow and adapter boundary.
 - `docs/google-drive-access.md`: safe future authorization procedure.

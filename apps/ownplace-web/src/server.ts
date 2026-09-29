@@ -1,13 +1,14 @@
 // OwnPlace write API: serves the built web UI and exposes JSON endpoints.
 // Reads serve local sims (static demo). Writes go through @rooted/timeline
-// — the SAME lane as the CLI — so web posts syndicate to every backend.
+// — the SAME lane as the CLI. M15 #100: each sim is one Kinfolk's porch;
+// the logged-in operator is OPERATOR_KINFOLK and posts to their porch only.
 //
 // Endpoints:
-//   GET  /api/timeline?backend=nextcloud-sim        own + local: followed porches
+//   GET  /api/timeline?backend=nextcloud-sim        porch owner + porches it follows
 //   GET  /api/story?backend=B&id=ID                 verified history story
 //   POST /api/open  {backend?, id, readerKey, readerId?}  open sealed body+media
-//   GET  /api/contacts                              contact list
-//   POST /api/post        {title, body, authorId?, authorName?}
+//   GET  /api/contacts?backend=B                    that porch's contact list
+//   POST /api/post        {title, body}  (as the operator Kinfolk only)
 //   POST /api/contacts    {id, displayName, address}  |  DELETE /api/contacts?id=ID
 //
 // Write auth: single-operator demo token via OWNPLACE_WRITE_TOKEN env.
@@ -26,7 +27,9 @@ import {
   addContact,
   backendsFromEnv,
   defaultRepoRoot,
+  demoKinfolkFor,
   isSafeHistoryId,
+  OPERATOR_KINFOLK,
   isSafeReaderId,
   publishStory,
   readContactFollowedTimeline,
@@ -58,6 +61,10 @@ if (!writeToken) {
 // with PUBLISH_ROOT set, API reads see what API/CLI writes, not stale data.
 const storesRoot = backendsFromEnv(repoRoot).root;
 
+// M15 #100: the operator's own porch holds the contacts the operator edits.
+const operator = demoKinfolkFor(OPERATOR_KINFOLK)!;
+const operatorPorch = operator.porch;
+
 function simStore(backend: string): LocalFolderStore {
   if (backend !== "nextcloud-sim" && backend !== "google-drive-sim") {
     throw new Error("unknown backend");
@@ -65,8 +72,8 @@ function simStore(backend: string): LocalFolderStore {
   return new LocalFolderStore(path.resolve(storesRoot, backend));
 }
 
-// M14 #97: the one place that picks which backend holds the signed
-// identity, so the creator's invite panel and the /i/ link always agree.
+// M14 #97: finds the backend holding a signed identity. M15 #100: only the
+// /i/<fp> link searches both porches; the invite panel reads the operator's.
 const INVITE_BACKENDS = ["nextcloud-sim", "google-drive-sim"] as const;
 
 async function findInviteIdentity(
@@ -201,11 +208,11 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       try {
-        // Address book lives on nextcloud-sim (the contacts write target).
-        // Own entries still come from the requested backend. https contacts
-        // are listed as not fetched; local: porches are verified independently.
+        // M15 #100: each porch reads its own address book, so a column shows
+        // its owner's posts plus the Kinfolk that owner follows. Followed
+        // porches are verified independently.
         const now = new Date().toISOString();
-        const merged = await readContactFollowedTimeline(storesRoot, backend, now, "nextcloud-sim");
+        const merged = await readContactFollowedTimeline(storesRoot, backend, now, backend);
         send(res, 200, {
           protocol: "rooted/v0.1",
           kind: "timeline",
@@ -232,7 +239,7 @@ const server = http.createServer(async (req, res) => {
       try {
         // Verified history package only: rejects tampered, missing-signature,
         // and legacy demo-placeholder packages with 404 (never serve them).
-        const story = await readVerifiedFollowedStory(storesRoot, backend, id, "nextcloud-sim");
+        const story = await readVerifiedFollowedStory(storesRoot, backend, id, backend);
         send(res, 200, story);
       } catch {
         send(res, 404, { error: "not found" });
@@ -270,7 +277,7 @@ const server = http.createServer(async (req, res) => {
       // old shape. Falsy check covers cross-version missing/null markers.
       let story;
       try {
-        story = await readVerifiedFollowedStory(storesRoot, backend, id, "nextcloud-sim");
+        story = await readVerifiedFollowedStory(storesRoot, backend, id, backend);
       } catch {
         send(res, 404, { error: "not found" });
         return;
@@ -299,7 +306,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (req.method === "GET" && pathname === "/api/contacts") {
-      const list = await readContacts(simStore("nextcloud-sim"));
+      const backend = url.searchParams.get("backend") ?? operatorPorch;
+      if (backend !== "nextcloud-sim" && backend !== "google-drive-sim") {
+        send(res, 400, { error: "unknown backend" });
+        return;
+      }
+      const list = await readContacts(simStore(backend));
       send(res, 200, list);
       return;
     }
@@ -361,13 +373,18 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const rec = (input ?? {}) as Record<string, unknown>;
+      // M15 #100: the composer posts as the logged-in Kinfolk only.
+      if ((rec.authorId !== undefined && rec.authorId !== operator.id) || rec.authorName !== undefined) {
+        send(res, 400, { error: "can only post as the logged-in Kinfolk" });
+        return;
+      }
       let validated;
       try {
         validated = validateInput({
           title: rec.title as string,
           body: rec.body as string,
-          authorId: rec.authorId as string | undefined,
-          authorName: rec.authorName as string | undefined,
+          authorId: operator.id,
+          authorName: operator.displayName,
         });
       } catch (e) {
         send(res, 400, { error: (e as Error).message });
@@ -397,7 +414,7 @@ const server = http.createServer(async (req, res) => {
       try {
         // resolveInvite only throws fixed, public-safe messages.
         const contact = await resolveInvite(invite);
-        await addContact(simStore("nextcloud-sim"), contact);
+        await addContact(simStore(operatorPorch), contact);
         send(res, 201, contact);
       } catch (e) {
         send(res, 400, { error: (e as Error).message });
@@ -409,7 +426,7 @@ const server = http.createServer(async (req, res) => {
         send(res, 401, { error: "unauthorized" });
         return;
       }
-      const store = simStore("nextcloud-sim");
+      const store = simStore(operatorPorch);
       if (req.method === "DELETE") {
         const id = (url.searchParams.get("id") ?? "").trim();
         if (!id || id.includes("/") || id.includes("\\") || id.includes("..") || id.includes("\0")) {
@@ -450,13 +467,14 @@ const server = http.createServer(async (req, res) => {
     // Public-safe: fingerprint, display name, bio, and a relative porch
     // path. No storage paths, tokens, or contacts.
     if (req.method === "GET" && pathname === "/api/invite") {
-      // M14 #97: no backend => first backend holding a signed identity.
+      // M15 #100: no backend => the operator's own porch only. The two
+      // porches are two people, so the panel never falls back to the other.
       const backend = url.searchParams.get("backend");
       if (backend !== null && backend !== "nextcloud-sim" && backend !== "google-drive-sim") {
         send(res, 400, { error: "unknown backend" });
         return;
       }
-      const identity = backend === null ? (await findInviteIdentity())?.identity : await porchIdentity(simStore(backend));
+      const identity = await porchIdentity(simStore(backend ?? operatorPorch));
       if (!identity) {
         send(res, 404, { error: "no signed identity on this porch yet" });
         return;

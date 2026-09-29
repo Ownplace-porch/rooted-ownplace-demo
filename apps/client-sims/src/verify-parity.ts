@@ -30,21 +30,18 @@ export async function verifyParity(): Promise<ParityResult> {
     ? resolve(process.env.PUBLISH_ROOT)
     : resolve(repoRoot, "demo/stores");
   const fetched: Record<string, { kinfolk: unknown; story: unknown; manifest: unknown; signature: unknown }> = {};
+  // M15 #100: the sims are two different Kinfolk, so they are never compared
+  // to each other. Each must verify on its own; each real cloud is compared
+  // only with the one porch it maps to (Alex: kevcloud, Sam: google-drive).
   for (const b of ["nextcloud-sim", "google-drive-sim"]) {
     try {
       fetched[b] = await new KinfolkClient(
         new LocalFolderStore(resolve(storesRoot, b)), b
       ).fetchPackage();
+      fingerprints[b] = fingerprint(fetched[b]);
       backends.push(b);
     } catch (e) {
       problems.push(`${b}: ${(e as Error).message}`);
-    }
-  }
-  if (fetched["nextcloud-sim"] && fetched["google-drive-sim"]) {
-    fingerprints["nextcloud-sim"] = fingerprint(fetched["nextcloud-sim"]);
-    fingerprints["google-drive-sim"] = fingerprint(fetched["google-drive-sim"]);
-    if (fingerprints["nextcloud-sim"] !== fingerprints["google-drive-sim"]) {
-      problems.push("cross-backend mismatch: sim fingerprints differ");
     }
   }
 
@@ -65,7 +62,7 @@ export async function verifyParity(): Promise<ParityResult> {
         fetched["nextcloud-sim"] &&
         fingerprints["kevcloud"] !== fingerprints["nextcloud-sim"]
       ) {
-        problems.push("cross-backend mismatch: kevcloud differs from sims");
+        problems.push("cross-backend mismatch: kevcloud differs from nextcloud-sim");
       }
     } catch (e) {
       problems.push(`kevcloud unreachable: ${(e as Error).message}`);
@@ -147,76 +144,16 @@ export async function verifyParity(): Promise<ParityResult> {
         });
         backends.push("google-drive");
         if (
-          fetched["nextcloud-sim"] &&
-          fingerprints["google-drive"] !== fingerprints["nextcloud-sim"]
+          fetched["google-drive-sim"] &&
+          fingerprints["google-drive"] !== fingerprints["google-drive-sim"]
         ) {
-          problems.push("cross-backend mismatch: google-drive differs from sims");
+          problems.push("cross-backend mismatch: google-drive differs from google-drive-sim");
         }
       }
     }
   }
 
-  // Timeline indexes must also match across sims (same stories, same order).
-  if (fetched["nextcloud-sim"] && fetched["google-drive-sim"]) {
-    const idxProblems = await compareTimelines(storesRoot);
-    problems.push(...idxProblems);
-  }
-
   return { ok: problems.length === 0, backends, fingerprints, problems };
-}
-
-async function readTimelineIds(
-  store: LocalFolderStore,
-  label: string,
-  problems: string[]
-): Promise<{ ids: string[] | null; malformed: boolean }> {
-  let index: { stories?: unknown };
-  try {
-    index = JSON.parse(new TextDecoder().decode(await store.readObject("timeline.json")));
-  } catch {
-    return { ids: null, malformed: false }; // no timeline yet: not a mismatch, just empty
-  }
-  if (!index || !Array.isArray(index.stories)) {
-    problems.push(`${label}: timeline.json is malformed`);
-    return { ids: [], malformed: true };
-  }
-  const ids: string[] = [];
-  let malformed = false;
-  const seen = new Set<string>();
-  for (const s of index.stories as { id?: unknown }[]) {
-    if (typeof s?.id !== "string" || s.id.length === 0) {
-      problems.push(`${label}: timeline has malformed entry`);
-      malformed = true;
-      continue;
-    }
-    if (seen.has(s.id)) {
-      problems.push(`${label}: timeline has duplicate entry ${s.id}`);
-      malformed = true;
-      continue;
-    }
-    seen.add(s.id);
-    ids.push(s.id);
-  }
-  return { ids, malformed };
-}
-
-async function compareTimelines(storesRoot: string): Promise<string[]> {
-  const problems: string[] = [];
-  const a = await readTimelineIds(
-    new LocalFolderStore(resolve(storesRoot, "nextcloud-sim")), "nextcloud-sim", problems
-  );
-  const b = await readTimelineIds(
-    new LocalFolderStore(resolve(storesRoot, "google-drive-sim")), "google-drive-sim", problems
-  );
-  const aIds: string[] | null = a.ids;
-  const bIds: string[] | null = b.ids;
-  if (aIds === null || bIds === null) return problems; // at least one side empty: nothing to compare
-  // A malformed side already reported specifics; the generic diff adds no signal.
-  if (a.malformed || b.malformed) return problems;
-  if (aIds.length !== bIds.length || !aIds.every((id, i) => id === bIds[i])) {
-    problems.push("cross-backend mismatch: timeline indexes differ");
-  }
-  return problems;
 }
 
 function isDirectRun(): boolean {

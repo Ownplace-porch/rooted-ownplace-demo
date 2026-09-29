@@ -1,10 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createManifest, hashObject, objectBytes, signManifest } from "@rooted/protocol";
+import { buildPackage } from "@rooted/timeline";
 import { LocalFolderStore } from "@rooted/storage";
 import { KinfolkClient } from "../src/client.js";
 import { verifyStores } from "../src/verify-feed.js";
@@ -12,24 +16,6 @@ import { verifyStores } from "../src/verify-feed.js";
 const testPair = generateKeyPairSync("ed25519");
 const testPrivateKey = testPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 const testPublicKey = testPair.publicKey.export({ type: "spki", format: "pem" }).toString();
-
-async function seedManifestPerBackend(root: string) {
-  const kinfolk = { id: "k-test", displayName: "Test Kinfolk", publicKey: testPublicKey };
-  const story = { id: "s-test", title: "t", body: "b", media: [], authorId: "k-test", createdAt: "2026-09-19T00:00:00.000Z" };
-  for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
-    const k = backend === "google-drive-sim" ? { ...kinfolk, displayName: "Impostor" } : kinfolk;
-    const manifest = createManifest("pkg-test", [
-      { path: "kinfolk.json", contentType: "application/json", value: k },
-      { path: "story.json", contentType: "application/json", value: story },
-    ], "ed25519");
-    const signature = signManifest(manifest, testPrivateKey);
-    const store = new LocalFolderStore(join(root, backend));
-    await store.writeObject("kinfolk.json", objectBytes(k));
-    await store.writeObject("story.json", objectBytes(story));
-    await store.writeObject("manifest.json", objectBytes(manifest));
-    await store.writeObject("signature.json", objectBytes(signature));
-  }
-}
 
 async function seedSharedManifest(root: string, tamperBody?: string) {
   const kinfolk = { id: "k-test", displayName: "Test Kinfolk", publicKey: testPublicKey };
@@ -66,9 +52,6 @@ test("simulated Kinfolk clients verify the identical package on both backends", 
     ]);
     assert.equal(hashObject(a.story), hashObject(b.story));
     assert.equal(a.manifest.packageId, b.manifest.packageId);
-    const report = await verifyStores(root);
-    assert.equal(report.ok, true);
-    assert.equal(report.packageId, "pkg-test");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -84,20 +67,6 @@ test("tampered story body fails verification on that backend only", async () => 
     );
     const ok = await clientFor(root, "nextcloud-sim").fetchPackage();
     assert.equal(ok.manifest.packageId, "pkg-test");
-  } finally {
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-test("kinfolk drift across backends fails cross-backend verification", async () => {
-  const root = await mkdtemp(join(tmpdir(), "rooted-sims-"));
-  try {
-    await seedManifestPerBackend(root);
-    await clientFor(root, "nextcloud-sim").fetchPackage();
-    await clientFor(root, "google-drive-sim").fetchPackage();
-    const report = await verifyStores(root);
-    assert.equal(report.ok, false);
-    assert.match(report.problems.join(";"), /cross-backend mismatch: kinfolk/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -177,4 +146,137 @@ test("reader rejects a legacy downgrade and an unsigned content file", async () 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// --- M15 #100: per-porch verification (replaces cross-backend parity) ---
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+const runLocal = promisify(execFile);
+
+// Seed the two-Kinfolk demo into a temp root with temp keys.
+async function withSeededDemo(fn: (root: string, reseed: () => Promise<unknown>) => Promise<void>): Promise<void> {
+  const dir = await mkdtemp(join(tmpdir(), "rooted-per-porch-"));
+  const root = join(dir, "stores");
+  const env: Record<string, string | undefined> = { ...process.env, PUBLISH_ROOT: root, OWNPLACE_IDENTITY_DIR: join(dir, "ids") };
+  delete env.KEVCLOUD_WEBDAV_URL;
+  delete env.GOOGLE_DRIVE_SYNC;
+  const saved = process.env.OWNPLACE_IDENTITY_DIR;
+  process.env.OWNPLACE_IDENTITY_DIR = join(dir, "ids");
+  try {
+    const reseed = () => runLocal(process.execPath, ["--import", "tsx", "apps/creator-bot/src/index.ts"], { cwd: repoRoot, env: env as NodeJS.ProcessEnv });
+    await reseed();
+    await fn(root, reseed);
+  } finally {
+    if (saved === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;
+    else process.env.OWNPLACE_IDENTITY_DIR = saved;
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+function problemsOf(report: Awaited<ReturnType<typeof verifyStores>>, porch: string): string {
+  return report.porches.find((p) => p.porch === porch)!.problems.join("; ");
+}
+
+test("per-porch verify: two Kinfolk, each verified on their own and following the other", async () => {
+  await withSeededDemo(async (root) => {
+    const report = await verifyStores(root);
+    assert.equal(report.ok, true, JSON.stringify(report.porches));
+    const [alex, sam] = report.porches;
+    assert.equal(alex.kinfolk, "kinfolk-alex");
+    assert.equal(sam.kinfolk, "kinfolk-sam");
+    assert.notEqual(alex.fingerprint, sam.fingerprint);
+    for (const p of report.porches) {
+      assert.ok(p.own >= 1, `${p.porch} has its own verified story`);
+      assert.ok(p.followed >= 1, `${p.porch} shows the other Kinfolk's story`);
+    }
+  });
+});
+
+test("per-porch verify: one person mirrored onto both porches fails", async () => {
+  await withSeededDemo(async (root) => {
+    await rm(join(root, "google-drive-sim"), { recursive: true, force: true });
+    await cp(join(root, "nextcloud-sim"), join(root, "google-drive-sim"), { recursive: true });
+    const report = await verifyStores(root);
+    assert.equal(report.ok, false);
+    assert.match(problemsOf(report, "google-drive-sim"), /not signed as kinfolk-sam/);
+  });
+});
+
+test("per-porch verify: a porch that does not follow the other Kinfolk fails", async () => {
+  await withSeededDemo(async (root) => {
+    const path = join(root, "google-drive-sim", "contacts.json");
+    const list = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({ ...list, contacts: [] }));
+    const report = await verifyStores(root);
+    assert.match(problemsOf(report, "google-drive-sim"), /does not follow kinfolk-alex/);
+    assert.equal(problemsOf(report, "nextcloud-sim"), "", "the other porch is unaffected");
+  });
+});
+
+test("per-porch verify: an unpinned follow fails", async () => {
+  await withSeededDemo(async (root) => {
+    const path = join(root, "nextcloud-sim", "contacts.json");
+    const list = JSON.parse(await readFile(path, "utf8"));
+    delete list.contacts[0].fingerprint;
+    await writeFile(path, JSON.stringify(list));
+    const report = await verifyStores(root);
+    assert.match(problemsOf(report, "nextcloud-sim"), /not pinned to their key/);
+  });
+});
+
+test("per-porch verify: a package on Sam's porch signed by another key fails", async () => {
+  await withSeededDemo(async (root) => {
+    // Alex's key signs a story that sits on Sam's porch.
+    const pkg = buildPackage({ title: "Squat", body: "not sam", authorId: "kinfolk-alex", authorName: "Alex Rowan", createdAt: "2026-09-20T00:00:00.000Z", storyId: "story-squat" });
+    const store = new LocalFolderStore(join(root, "google-drive-sim"));
+    for (const [name, bytes] of Object.entries(pkg.files)) await store.writeObject(`timeline/story-squat/${name}`, bytes);
+    const report = await verifyStores(root);
+    assert.match(problemsOf(report, "google-drive-sim"), /history story-squat: signer does not match/);
+    // Alex follows Sam pinned to Sam's key, so the squat is refused there too.
+    assert.match(problemsOf(report, "nextcloud-sim"), /followed kinfolk-sam story-squat: signer does not match/);
+  });
+});
+
+test("per-porch verify: tampered history fails its own porch only", async () => {
+  await withSeededDemo(async (root) => {
+    await writeFile(join(root, "nextcloud-sim", "timeline", "story-first-light", "story.json"), "{not json");
+    const report = await verifyStores(root);
+    assert.match(problemsOf(report, "nextcloud-sim"), /history story-first-light: invalid JSON: story\.json/);
+    // Sam still verifies his own porch; his view of Alex reports the bad entry.
+    assert.ok(!/history/.test(problemsOf(report, "google-drive-sim")));
+  });
+});
+
+test("per-porch verify: two Kinfolk sharing one signing key fails", async () => {
+  await withSeededDemo(async (root, reseed) => {
+    // Sam's key file replaced by Alex's: same person under two names.
+    const ids = join(root, "..", "ids");
+    await writeFile(join(ids, "kinfolk-sam.pem"), await readFile(join(ids, "kinfolk-alex.pem")));
+    await rm(join(root, "google-drive-sim"), { recursive: true, force: true });
+    await reseed();
+    const report = await verifyStores(root);
+    assert.match(problemsOf(report, "google-drive-sim"), /shares a signing key with nextcloud-sim/);
+    assert.match(problemsOf(report, "nextcloud-sim"), /shares a signing key with google-drive-sim/);
+  });
+});
+
+test("per-porch verify: a porch with no signed history, and its follower, both fail", async () => {
+  await withSeededDemo(async (root) => {
+    // Flat latest copy stays; timeline/ history is gone from Sam's porch.
+    await rm(join(root, "google-drive-sim", "timeline"), { recursive: true, force: true });
+    const report = await verifyStores(root);
+    assert.match(problemsOf(report, "google-drive-sim"), /no verified history signed by the porch owner/);
+    assert.match(problemsOf(report, "nextcloud-sim"), /no verified entries from kinfolk-sam/);
+  });
+});
+
+test("per-porch verify: a follow pointing at the wrong porch fails", async () => {
+  await withSeededDemo(async (root) => {
+    const path = join(root, "nextcloud-sim", "contacts.json");
+    const list = JSON.parse(await readFile(path, "utf8"));
+    list.contacts[0].address = "local:nextcloud-sim";
+    await writeFile(path, JSON.stringify(list));
+    const report = await verifyStores(root);
+    assert.match(problemsOf(report, "nextcloud-sim"), /follows kinfolk-sam at the wrong address/);
+  });
 });

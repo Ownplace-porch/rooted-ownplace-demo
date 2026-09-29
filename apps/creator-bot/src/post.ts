@@ -4,7 +4,7 @@
 // {readerId, pubkeyFile} or {readerId, publicKey}); combines with the legacy single-reader flags.
 
 import { readFileSync } from "node:fs";
-import { defaultRepoRoot, backendsFromEnv, publishStory, validateInput } from "@rooted/timeline";
+import { defaultRepoRoot, backendsFromEnv, demoKinfolkFor, NO_PORCH, publishStory, validateInput } from "@rooted/timeline";
 
 function arg(name: string): string | undefined {
   const idx = process.argv.indexOf(`--${name}`);
@@ -14,7 +14,7 @@ function arg(name: string): string | undefined {
   return value;
 }
 
-const USAGE = 'usage: npm run post -- --title "TITLE" --body "BODY" [--author-id ID] [--author-name NAME] [--members-only] [--entitle-reader ID --reader-pubkey FILE] [--entitle-readers JSONFILE]';
+const USAGE = 'usage: npm run post -- --title "TITLE" --body "BODY" [--author-id kinfolk-alex|kinfolk-sam] [--author-name NAME] [--members-only] [--entitle-reader ID --reader-pubkey FILE] [--entitle-readers JSONFILE]';
 
 function fail(message: string): never {
   console.error(`post failed: ${message}`);
@@ -39,6 +39,10 @@ try {
   console.error(USAGE);
   process.exit(2);
 }
+
+// M15 #100: each demo Kinfolk posts to their own porch; there is no porch
+// for any other author id, so the post is refused before signing.
+if (!demoKinfolkFor(validated.authorId)) fail(NO_PORCH);
 
 let entitle: { readerId: string; readerPublicKey: string } | undefined;
 const entitleReader = arg("entitle-reader");

@@ -1,31 +1,101 @@
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hashObject } from "@rooted/protocol";
+import { identityFingerprint } from "@rooted/protocol";
 import { LocalFolderStore } from "@rooted/storage";
-import { KinfolkClient, type VerifiedPackage } from "./client.js";
+import {
+  DEMO_KINFOLK,
+  readAuthenticatedTimeline,
+  readContactFollowedTimeline,
+  readContacts,
+  type DemoKinfolk,
+} from "@rooted/timeline";
+import { KinfolkClient } from "./client.js";
 
 // Repo root resolved from this file, not cwd: `npm run verify` executes
 // with cwd set to the workspace dir (apps/client-sims).
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-function packageFingerprint(pkg: VerifiedPackage): string {
-  return hashObject({ kinfolk: pkg.kinfolk, story: pkg.story, manifest: pkg.manifest, signature: pkg.signature });
+// M15 #100: per-porch verification replaces cross-backend parity. Each
+// porch belongs to one Kinfolk and must verify on its own:
+//   1. its latest package verifies (hashes + Ed25519) and is signed as its owner;
+//   2. every timeline/ history package verifies and is signed by the owner's key;
+//   3. it follows each other demo Kinfolk at their local: porch, pinned to
+//      that Kinfolk's key, and the followed entries verify against that key.
+// The two porches must hold two different keys: mirroring one person fails.
+export interface PorchReport {
+  porch: string;
+  kinfolk: string;
+  fingerprint?: string;
+  own: number;
+  followed: number;
+  problems: string[];
 }
 
-export async function verifyStores(storesRoot = resolve(repoRoot, "demo/stores")) {
-  const clients = ["nextcloud-sim", "google-drive-sim"].map(
-    (backend) => new KinfolkClient(new LocalFolderStore(resolve(storesRoot, backend)), backend)
-  );
-  const [a, b] = await Promise.all(clients.map((c) => c.fetchPackage()));
-  // Byte-identity across backends: every object must match, not just story+id.
-  // (CI also runs `diff -r` as an independent byte check.)
-  const problems: string[] = [];
-  for (const key of ["kinfolk", "story", "manifest", "signature"] as const) {
-    if (hashObject(a[key]) !== hashObject(b[key])) problems.push(`cross-backend mismatch: ${key}`);
+interface Identity { kinfolk: DemoKinfolk; fingerprint?: string }
+
+async function porchIdentityOf(storesRoot: string, kinfolk: DemoKinfolk, problems: string[]): Promise<Identity> {
+  try {
+    const pkg = await new KinfolkClient(new LocalFolderStore(resolve(storesRoot, kinfolk.porch)), kinfolk.porch).fetchPackage();
+    const signer = pkg.kinfolk as { id?: unknown; publicKey?: unknown };
+    if (signer.id !== kinfolk.id) {
+      problems.push(`latest package is not signed as ${kinfolk.id}`);
+      return { kinfolk };
+    }
+    return { kinfolk, fingerprint: identityFingerprint(String(signer.publicKey)) };
+  } catch (e) {
+    problems.push((e as Error).message);
+    return { kinfolk };
   }
-  if (a.manifest.packageId !== b.manifest.packageId) problems.push("cross-backend mismatch: packageId");
-  const ok = problems.length === 0;
-  return { ok, problems, packageId: a.manifest.packageId, title: String(a.story.title), fingerprint: packageFingerprint(a) };
+}
+
+async function verifyPorch(storesRoot: string, self: Identity, others: Identity[], problems: string[], now: string): Promise<{ own: number; followed: number }> {
+  const porch = self.kinfolk.porch;
+  const store = new LocalFolderStore(resolve(storesRoot, porch));
+  if (!self.fingerprint) return { own: 0, followed: 0 };
+  const history = await readAuthenticatedTimeline(store, porch, now, self.fingerprint);
+  for (const s of history.index.skipped ?? []) problems.push(`history ${s.id}: ${s.reason}`);
+  const own = history.index.stories.length;
+  if (own === 0) problems.push("no verified history signed by the porch owner");
+
+  const contacts = (await readContacts(store)).contacts;
+  const merged = await readContactFollowedTimeline(storesRoot, porch, now);
+  for (const s of merged.skipped) {
+    if (s.porch !== porch) problems.push(`followed ${s.porch} ${s.id}: ${s.reason}`);
+  }
+  let followed = 0;
+  for (const other of others) {
+    const contact = contacts.find((c) => c.id === other.kinfolk.id);
+    if (!contact) {
+      problems.push(`does not follow ${other.kinfolk.id}`);
+      continue;
+    }
+    if (contact.address !== `local:${other.kinfolk.porch}`) problems.push(`follows ${other.kinfolk.id} at the wrong address`);
+    if (!other.fingerprint || contact.fingerprint !== other.fingerprint) problems.push(`follow of ${other.kinfolk.id} is not pinned to their key`);
+    const entries = merged.stories.filter((s) => s.origin === other.kinfolk.id).length;
+    if (entries === 0) problems.push(`no verified entries from ${other.kinfolk.id}`);
+    followed += entries;
+  }
+  return { own, followed };
+}
+
+export async function verifyStores(storesRoot = resolve(repoRoot, "demo/stores"), now = new Date().toISOString()) {
+  const problems: Record<string, string[]> = {};
+  const identities: Identity[] = [];
+  for (const kinfolk of DEMO_KINFOLK) {
+    problems[kinfolk.porch] = [];
+    identities.push(await porchIdentityOf(storesRoot, kinfolk, problems[kinfolk.porch]));
+  }
+  const porches: PorchReport[] = [];
+  for (const self of identities) {
+    const list = problems[self.kinfolk.porch];
+    const others = identities.filter((i) => i !== self);
+    for (const other of others) {
+      if (self.fingerprint && self.fingerprint === other.fingerprint) list.push(`shares a signing key with ${other.kinfolk.porch}`);
+    }
+    const counts = await verifyPorch(storesRoot, self, others, list, now);
+    porches.push({ porch: self.kinfolk.porch, kinfolk: self.kinfolk.id, fingerprint: self.fingerprint, ...counts, problems: list });
+  }
+  return { ok: porches.every((p) => p.problems.length === 0), porches };
 }
 
 function isDirectRun(): boolean {
@@ -34,10 +104,13 @@ function isDirectRun(): boolean {
 }
 
 if (isDirectRun()) {
-  const report = await verifyStores();
-  console.log(`verify: ${report.ok ? "OK" : "MISMATCH"} package=${report.packageId} title="${report.title}" backends=nextcloud-sim,google-drive-sim`);
-  if (!report.ok) {
-    for (const p of report.problems) console.error(` - ${p}`);
-    process.exit(1);
+  const storesRoot = process.env.PUBLISH_ROOT ? resolve(process.env.PUBLISH_ROOT) : undefined;
+  const report = await verifyStores(storesRoot);
+  for (const p of report.porches) {
+    const key = p.fingerprint ? ` key=${p.fingerprint.slice(0, 16)}…` : "";
+    console.log(`verify ${p.porch}: ${p.problems.length ? "FAIL" : "OK"} kinfolk=${p.kinfolk}${key} own=${p.own} followed=${p.followed}`);
+    for (const problem of p.problems) console.error(` - ${p.porch}: ${problem}`);
   }
+  console.log(`verify: ${report.ok ? "OK" : "FAIL"}`);
+  if (!report.ok) process.exit(1);
 }

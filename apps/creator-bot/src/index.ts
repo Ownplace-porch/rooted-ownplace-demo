@@ -1,108 +1,74 @@
-// LEGACY seed publisher (pre-timeline). Writes the single canned sample story
-// to the flat latest-copy paths. It overwrites only the seed files in place
-// and PRESERVES timeline/ history accumulated by `npm run post` (see #41).
-// Kept for CI seeding + first-run demo only; prefer `npm run post`.
-// Cloud publisher: writes the SAME story package to all configured backends:
-//   1. demo/stores/nextcloud-sim  (LocalFolderStore)
-//   2. demo/stores/google-drive-sim (LocalFolderStore)
-//   3. kevcloud Nextcloud (WebDavStore) — only when KEVCLOUD_* env is set
-//   4. Google Drive via rclone (execFile, rooted_drive:) — only when
-//      GOOGLE_DRIVE_SYNC=1 and rclone remote exists (Hostinger).
-// Credentials: env only, never committed. Skipped backends are reported,
-// never faked — verify-parity checks only backends that published.
+// Demo seed publisher. M15 #100: two Kinfolk, one cloud each.
+//   Alex (kinfolk-alex) -> demo/stores/nextcloud-sim, plus the real kevcloud
+//     Nextcloud (WebDavStore) only when KEVCLOUD_WEBDAV_URL/USER/PASS is set.
+//   Sam (kinfolk-sam)   -> demo/stores/google-drive-sim, plus the real Google
+//     Drive via rclone only when GOOGLE_DRIVE_SYNC=1.
+// Each posts their own signed story through the same lane as `npm run post`,
+// then each porch's contacts.json follows the other with a local: address
+// pinned to the other Kinfolk's key fingerprint (M10 + M13 machinery).
+// Re-running is idempotent: fixed story ids and dates, deterministic Ed25519
+// signatures, and timeline/ history from `npm run post` is kept (see #41).
+// Credentials: env only, never committed. Skipped clouds are reported.
 
-import { mkdir } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { identityFingerprint, loadOrCreateIdentity } from "@rooted/protocol";
+import { LocalFolderStore } from "@rooted/storage";
 import {
-  createManifest,
-  loadOrCreateIdentity,
-  signManifest,
-  objectBytes,
-  type Kinfolk,
-  type Story,
-} from "@rooted/protocol";
-import { LocalFolderStore, WebDavStore, type ObjectStore } from "@rooted/storage";
+  DEMO_KINFOLK,
+  addContact,
+  backendsFromEnv,
+  defaultRepoRoot,
+  publishStory,
+  type DemoKinfolk,
+} from "@rooted/timeline";
+import { resolve } from "node:path";
 
-const run = promisify(execFile);
-
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
-const root = process.env.PUBLISH_ROOT
-  ? resolve(process.env.PUBLISH_ROOT)
-  : resolve(repoRoot, "demo/stores");
-
-const identity = loadOrCreateIdentity("kinfolk-alex");
-const kinfolk: Kinfolk = {
-  id: "kinfolk-alex",
-  displayName: "Alex Rowan",
-  bio: "Building a more rooted internet.",
-  publicKey: identity.publicKey,
+const SEED_STORIES: Record<string, { storyId: string; createdAt: string; title: string; body: string }> = {
+  "kinfolk-alex": {
+    storyId: "story-first-light",
+    createdAt: "2026-09-19T09:00:00.000Z",
+    title: "First light at the workshop",
+    body: "A small place can hold a big beginning. Today we opened the doors, shared a meal, and made room for one another.",
+  },
+  "kinfolk-sam": {
+    storyId: "story-garden-table",
+    createdAt: "2026-09-19T10:00:00.000Z",
+    title: "A table in the garden",
+    body: "My porch lives on a different cloud, and you can still read it. We set a long table under the trees and kept a seat open.",
+  },
 };
-const story: Story = {
-  id: "story-first-light",
-  title: "First light at the workshop",
-  body: "A small place can hold a big beginning. Today we opened the doors, shared a meal, and made room for one another.",
-  media: [],
-  authorId: kinfolk.id,
-  createdAt: "2026-09-19T09:00:00.000Z",
-};
-const packageId = "rooted-demo-first-light";
-const content = [
-  { path: "kinfolk.json", contentType: "application/json", value: kinfolk },
-  { path: "story.json", contentType: "application/json", value: story },
-];
-const manifest = createManifest(packageId, content, "ed25519");
-const signature = signManifest(manifest, identity.privateKey);
 
-const files: Record<string, Uint8Array> = {};
-for (const object of content) files[object.path] = objectBytes(object.value);
-files["manifest.json"] = objectBytes(manifest);
-files["signature.json"] = objectBytes(signature);
-
-async function publishTo(label: string, store: ObjectStore): Promise<void> {
-  for (const [name, bytes] of Object.entries(files)) {
-    await store.writeObject(name, bytes);
-  }
-  console.log(`published ${packageId} to ${label}`);
-}
-
+const backends = backendsFromEnv(defaultRepoRoot());
 const published: string[] = [];
+const skipped = new Set<string>();
 
-// 1+2. Local sims (always; seed files are overwritten in place so timeline/
-// history accumulated by `npm run post` survives — see #41. Both sims get
-// the same bytes, so they stay identical).
-for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
-  const dir = resolve(root, backend);
-  await mkdir(dir, { recursive: true });
-  await publishTo(backend, new LocalFolderStore(dir));
-  published.push(backend);
+async function seed(kinfolk: DemoKinfolk): Promise<void> {
+  const story = SEED_STORIES[kinfolk.id];
+  const res = await publishStory(
+    { title: story.title, body: story.body, media: [], authorId: kinfolk.id, authorName: kinfolk.displayName, authorBio: kinfolk.bio },
+    backends,
+    { storyId: story.storyId, createdAt: story.createdAt },
+  );
+  published.push(...res.backends.map((b) => `${b} (${kinfolk.displayName})`));
+  for (const s of res.skipped) skipped.add(s);
 }
 
-// 3. Real kevcloud Nextcloud over WebDAV (opt-in via env).
-if (process.env.KEVCLOUD_WEBDAV_URL && process.env.KEVCLOUD_WEBDAV_USER && process.env.KEVCLOUD_WEBDAV_PASS) {
-  const store = new WebDavStore({
-    baseUrl: process.env.KEVCLOUD_WEBDAV_URL,
-    username: process.env.KEVCLOUD_WEBDAV_USER,
-    password: process.env.KEVCLOUD_WEBDAV_PASS,
-  });
-  await publishTo("kevcloud (WebDAV)", store);
-  published.push("kevcloud");
-} else {
-  console.log("skip kevcloud: KEVCLOUD_WEBDAV_URL/USER/PASS not set");
+for (const kinfolk of DEMO_KINFOLK) await seed(kinfolk);
+
+// Each Kinfolk follows the other, pinned to the key that signs their posts.
+for (const kinfolk of DEMO_KINFOLK) {
+  const store = new LocalFolderStore(resolve(backends.root, kinfolk.porch));
+  for (const other of DEMO_KINFOLK) {
+    if (other.id === kinfolk.id) continue;
+    await addContact(store, {
+      id: other.id,
+      displayName: other.displayName,
+      addedAt: new Date().toISOString(),
+      address: `local:${other.porch}`,
+      fingerprint: identityFingerprint(loadOrCreateIdentity(other.id).publicKey),
+    });
+    console.log(`${kinfolk.displayName} follows ${other.displayName} (local:${other.porch})`);
+  }
 }
 
-// 4. Real Google Drive via rclone (opt-in, Hostinger).
-if (process.env.GOOGLE_DRIVE_SYNC === "1") {
-  const remote = process.env.GOOGLE_DRIVE_REMOTE ?? "rooted_drive:";
-  const folder = process.env.GOOGLE_DRIVE_FOLDER ?? "Rooted OwnPlace Demo";
-  const src = resolve(root, "google-drive-sim") + "/";
-  await run("rclone", ["copy", src, `${remote}${folder}/`, "--timeout", "30s"]);
-  console.log(`published ${packageId} to google-drive (rclone ${remote}${folder}/)`);
-  published.push("google-drive");
-} else {
-  console.log("skip google-drive: GOOGLE_DRIVE_SYNC!=1");
-}
-
-console.log(`done: ${published.join(", ")}`);
+const unusedClouds = [...skipped].filter((cloud) => !published.some((p) => p.startsWith(`${cloud} `)));
+console.log(`done: ${published.join(", ")}${unusedClouds.length ? `; not synced: ${unusedClouds.join(", ")}` : ""}`);

@@ -21,5 +21,4 @@ jobs:
       - run: npm test
       - run: npm run publish
       - run: npm run verify
-      - run: diff -r demo/stores/nextcloud-sim demo/stores/google-drive-sim
       - run: npm run build

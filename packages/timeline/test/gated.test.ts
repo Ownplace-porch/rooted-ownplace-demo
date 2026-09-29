@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { access, mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalFolderStore } from "@rooted/storage";
@@ -69,7 +69,7 @@ test("gated build seals the body and binds the envelope to the manifest", async 
   });
 });
 
-test("gated publish lands identical bytes on both sims; title stays public", async () => {
+test("gated publish lands on the author's porch only; title stays public", async () => {
   await withIdDir(async (dir) => {
     const reader = x25519Pair();
     const stranger = x25519Pair();
@@ -84,11 +84,10 @@ test("gated publish lands identical bytes on both sims; title stays public", asy
       },
     );
     assert.ok(res.backends.includes("nextcloud-sim"));
-    assert.ok(res.backends.includes("google-drive-sim"));
+    assert.ok(!res.backends.includes("google-drive-sim"), "M15 #100: no mirror to the other Kinfolk's porch");
     const a = await readFile(join(root, "nextcloud-sim/timeline/story-gated-2/story.json"), "utf8");
-    const b = await readFile(join(root, "google-drive-sim/timeline/story-gated-2/story.json"), "utf8");
-    assert.equal(a, b);
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    await assert.rejects(access(join(root, "google-drive-sim")), "M15 #100: the other porch is untouched");
+    for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));
       const story = (await fetchVerifiedHistoryPackage(store, "story-gated-2")).story;
       assert.equal(story.body, "");
@@ -200,7 +199,7 @@ test("multi-reader build opens for each entitled reader; stranger blocked", asyn
   });
 });
 
-test("multi-reader publish lands identical bytes on both sims", async () => {
+test("multi-reader publish lands on the author's porch only", async () => {
   await withIdDir(async (dir) => {
     const a = x25519Pair();
     const b = x25519Pair();
@@ -221,11 +220,10 @@ test("multi-reader publish lands identical bytes on both sims", async () => {
       },
     );
     assert.ok(res.backends.includes("nextcloud-sim"));
-    assert.ok(res.backends.includes("google-drive-sim"));
+    assert.ok(!res.backends.includes("google-drive-sim"), "M15 #100: no mirror to the other Kinfolk's porch");
     const fa = await readFile(join(root, "nextcloud-sim/timeline/story-gated-multi-3/story.json"), "utf8");
-    const fb = await readFile(join(root, "google-drive-sim/timeline/story-gated-multi-3/story.json"), "utf8");
-    assert.equal(fa, fb);
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    await assert.rejects(access(join(root, "google-drive-sim")), "M15 #100: the other porch is untouched");
+    for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));
       const story = (await fetchVerifiedHistoryPackage(store, "story-gated-multi-3")).story;
       assert.equal(story.body, "");
@@ -505,7 +503,7 @@ test("m4 flat-copy: gated then public clears stale flat entitlements.json", asyn
       { root },
       { createdAt: "2026-09-20T00:00:00.000Z", storyId: gatedId, entitle: { readerId: "reader-bob", readerPublicKey: reader.pub } }
     );
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));
       assert.equal(await store.exists("entitlements.json"), true);
       const flat = JSON.parse(new TextDecoder().decode(await store.readObject("entitlements.json")));
@@ -516,7 +514,7 @@ test("m4 flat-copy: gated then public clears stale flat entitlements.json", asyn
       { root },
       { createdAt: "2026-09-20T00:00:01.000Z", storyId: publicId }
     );
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));
       assert.equal(await store.exists("entitlements.json"), false);
       const gatedPkg = await fetchVerifiedHistoryPackage(store, gatedId);
@@ -525,9 +523,7 @@ test("m4 flat-copy: gated then public clears stale flat entitlements.json", asyn
       assert.equal(publicPkg.entitlements, undefined);
       assert.equal(publicPkg.story.body, "everyone reads");
     }
-    const aFlat = await readFile(join(root, "nextcloud-sim", "story.json"), "utf8");
-    const bFlat = await readFile(join(root, "google-drive-sim", "story.json"), "utf8");
-    assert.equal(aFlat, bFlat);
+    await assert.rejects(access(join(root, "google-drive-sim")), "M15 #100: the other porch is untouched");
   });
 });
 
@@ -548,7 +544,7 @@ test("m4 flat-copy: gated then gated rotates flat sidecar to latest story", asyn
       { root },
       { createdAt: "2026-09-20T00:00:01.000Z", storyId: secondId, entitle: { readerId: "reader-b", readerPublicKey: b.pub } }
     );
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));
       assert.equal(await store.exists("entitlements.json"), true);
       const flat = JSON.parse(new TextDecoder().decode(await store.readObject("entitlements.json")));
@@ -559,9 +555,7 @@ test("m4 flat-copy: gated then gated rotates flat sidecar to latest story", asyn
       const secondPkg = await fetchVerifiedHistoryPackage(store, secondId);
       assert.equal(secondPkg.entitlements?.storyId, secondId);
     }
-    const aFlat = await readFile(join(root, "nextcloud-sim", "entitlements.json"), "utf8");
-    const bFlat = await readFile(join(root, "google-drive-sim", "entitlements.json"), "utf8");
-    assert.equal(aFlat, bFlat);
+    await assert.rejects(access(join(root, "google-drive-sim")), "M15 #100: the other porch is untouched");
   });
 });
 
@@ -578,7 +572,7 @@ test("m4 flat-copy: public then public stays absent", async () => {
       { root },
       { createdAt: "2026-09-20T00:00:01.000Z", storyId: "story-flat-free-b" }
     );
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));
       assert.equal(await store.exists("entitlements.json"), false);
       const firstPkg = await fetchVerifiedHistoryPackage(store, "story-flat-free-a");
@@ -671,7 +665,7 @@ test("M8 #65 gated build seals media with the body; clear media stays empty", as
   });
 });
 
-test("M8 #65 gated publish with media verifies green on both sims", async () => {
+test("M8 #65 gated publish with media verifies green on the author's porch", async () => {
   await withIdDir(async (dir) => {
     const reader = x25519Pair();
     const media = ["https://example.com/a.jpg"];
@@ -686,12 +680,11 @@ test("M8 #65 gated publish with media verifies green on both sims", async () => 
       entitle: { readerId: "reader-bob", readerPublicKey: reader.pub },
     });
     assert.ok(res.backends.includes("nextcloud-sim"));
-    assert.ok(res.backends.includes("google-drive-sim"));
+    assert.ok(!res.backends.includes("google-drive-sim"), "M15 #100: no mirror to the other Kinfolk's porch");
     const a = await readFile(join(root, "nextcloud-sim/timeline/story-gated-media-2/story.json"), "utf8");
-    const b = await readFile(join(root, "google-drive-sim/timeline/story-gated-media-2/story.json"), "utf8");
-    assert.equal(a, b);
+    await assert.rejects(access(join(root, "google-drive-sim")), "M15 #100: the other porch is untouched");
     assert.ok(!a.includes("example.com"), "sealed media must not leak into clear JSON");
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));
       const story = (await fetchVerifiedHistoryPackage(store, "story-gated-media-2")).story;
       assert.equal(story.body, "");

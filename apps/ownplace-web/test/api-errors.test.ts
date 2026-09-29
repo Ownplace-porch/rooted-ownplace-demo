@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -308,7 +308,7 @@ test("web timeline merges local followed porches and isolates tamper (#76)", asy
       id: "porch-alex", displayName: "Alex", address: "local:porch-alex/nextcloud-sim",
     }))).status, 201);
     assert.equal((await client.request("POST", "/api/contacts", JSON.stringify({
-      id: "porch-sam", displayName: "Sam", address: "local:porch-sam/nextcloud-sim",
+      id: "porch-sam", displayName: "Sam", address: "local:porch-sam/google-drive-sim",
     }))).status, 201);
     assert.equal((await client.request("POST", "/api/contacts", JSON.stringify({
       id: "remote-jo", displayName: "Jo", address: "https://10.0.0.5/jo",
@@ -331,12 +331,28 @@ test("web timeline merges local followed porches and isolates tamper (#76)", asy
     assert.equal(story.status, 200);
     assert.equal((story.json as { body?: string }).body, "from alex");
 
+    // M15 #100: each column reads its own porch's address book. The drive
+    // porch follows nobody yet, so it shows none of the nextcloud follows...
     const drive = await client.request("GET", "/api/timeline?backend=google-drive-sim");
-    const driveIds = ((drive.json as { stories: { id: string }[] }).stories).map((s) => s.id);
-    assert.ok(driveIds.includes("story-alex-1"));
-    assert.ok(driveIds.includes("story-own-1"));
+    assert.deepEqual((drive.json as { stories: { id: string }[] }).stories, []);
+    // ...until its own contacts.json follows a porch.
+    await addContact(new LocalFolderStore(join(tmp, "google-drive-sim")), validateContact({
+      id: "kinfolk-alex", displayName: "Alex Rowan", address: "local:nextcloud-sim",
+    }));
+    const driveFollows = await client.request("GET", "/api/timeline?backend=google-drive-sim");
+    const driveStories = (driveFollows.json as { stories: { id: string; origin?: string }[] }).stories;
+    assert.deepEqual(driveStories.map((s) => [s.id, s.origin]), [["story-own-1", "kinfolk-alex"]]);
+    const driveStory = await client.request("GET", "/api/story?backend=google-drive-sim&id=story-own-1");
+    assert.equal((driveStory.json as { body?: string }).body, "mine");
+    assert.equal((await client.request("GET", "/api/story?backend=google-drive-sim&id=story-alex-1")).status, 404,
+      "the drive porch does not read through nextcloud's follows");
+    assert.equal((await client.request("POST", "/api/open", JSON.stringify({ backend: "google-drive-sim", id: "story-alex-1" }))).status, 404);
+    assert.equal((await client.request("POST", "/api/open", JSON.stringify({ backend: "google-drive-sim", id: "story-own-1" }))).status, 200);
+    const driveContacts = await client.request("GET", "/api/contacts?backend=google-drive-sim");
+    assert.deepEqual(((driveContacts.json as { contacts: { id: string }[] }).contacts).map((c) => c.id), ["kinfolk-alex"]);
+    assert.equal((await client.request("GET", "/api/contacts?backend=other")).status, 400);
 
-    await writeFile(join(tmp, "porch-sam/nextcloud-sim/timeline/story-sam-1/story.json"), "{not json");
+    await writeFile(join(tmp, "porch-sam/google-drive-sim/timeline/story-sam-1/story.json"), "{not json");
     const again = await client.request("GET", "/api/timeline?backend=nextcloud-sim");
     const againBody = again.json as { stories: { id: string }[]; skipped: { id: string; porch?: string }[] };
     assert.deepEqual(againBody.stories.map((s) => s.id), ["story-alex-1", "story-own-1"]);
@@ -478,40 +494,80 @@ test("invite routes are public-safe and follow-by-invite fails closed (#92)", as
 
 // M14 #97: the creator's invite panel follows the signed identity when
 // nextcloud-sim is gone, agreeing with the /i/ link.
-test("/api/invite with no backend falls back to google-drive-sim like /i/ (#97)", async () => {
+test("/api/invite with no backend shows only the operator's invite; /i/ serves both (#97, #100)", async () => {
   const { client, tmp } = await boot();
   const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
   process.env.OWNPLACE_IDENTITY_DIR = join(tmp, "ids");
   try {
     assert.equal((await client.request("GET", "/api/invite")).status, 404, "no invite before a signed post");
+    // M15 #100: only Sam has posted. The operator (Alex) must not be handed
+    // Sam's invite: the two porches are two different people.
     await publishStory(
-      { title: "Hi", body: "moved porch", authorId: "kinfolk-rowan", authorName: "Rowan" },
+      { title: "Hi", body: "sam's porch", authorId: "kinfolk-sam", authorName: "Sam" },
       { root: tmp },
       { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-invite-97" },
     );
-    const before = await client.request("GET", "/api/invite");
-    assert.equal(before.status, 200);
-    const { fingerprint } = before.json as { fingerprint: string };
-    assert.equal(fingerprint, ((await client.request("GET", "/api/invite?backend=nextcloud-sim")).json as { fingerprint: string }).fingerprint);
+    assert.equal((await client.request("GET", "/api/invite")).status, 404, "panel never shows the other Kinfolk's invite");
+    const sam = await client.request("GET", "/api/invite?backend=google-drive-sim");
+    assert.equal(sam.status, 200);
+    const { fingerprint } = sam.json as { fingerprint: string };
+    assert.ok(!sam.raw.includes(tmp), "invite leaked a store path");
 
-    await rename(join(tmp, "nextcloud-sim"), join(tmp, "nextcloud-sim.moved"));
-
-    const info = await client.request("GET", "/api/invite");
-    assert.equal(info.status, 200, "panel still finds the signed identity");
-    assert.equal((info.json as { fingerprint: string }).fingerprint, fingerprint);
-    assert.equal((info.json as { path: string }).path, `i/${fingerprint}`);
-    assert.ok(!info.raw.includes(tmp), "invite leaked a store path");
-
+    // Sam's own invite link still resolves to Sam's porch.
     const doc = await client.request("GET", `/i/${fingerprint}.json`);
     assert.equal(doc.status, 200);
     assert.equal((doc.json as { porch: string }).porch, "../porch/google-drive-sim");
 
     assert.equal((await client.request("GET", "/api/invite?backend=nextcloud-sim")).status, 404);
     assert.equal((await client.request("GET", "/api/invite?backend=other")).status, 400);
+
+    // Once Alex posts, the panel shows Alex's invite; each link resolves to its own porch.
+    await publishStory(
+      { title: "Hi", body: "alex's porch", authorId: "kinfolk-alex", authorName: "Alex Rowan" },
+      { root: tmp },
+      { createdAt: "2026-09-29T00:01:00.000Z", storyId: "story-invite-97-alex" },
+    );
+    const info = await client.request("GET", "/api/invite");
+    assert.equal(info.status, 200);
+    const alex = info.json as { fingerprint: string; path: string };
+    assert.equal(alex.fingerprint, ((await client.request("GET", "/api/invite?backend=nextcloud-sim")).json as { fingerprint: string }).fingerprint);
+    assert.notEqual(alex.fingerprint, fingerprint);
+    assert.equal(alex.path, `i/${alex.fingerprint}`);
+    assert.equal(((await client.request("GET", `/i/${alex.fingerprint}.json`)).json as { porch: string }).porch, "../porch/nextcloud-sim");
+    assert.equal(((await client.request("GET", `/i/${fingerprint}.json`)).json as { porch: string }).porch, "../porch/google-drive-sim");
   } finally {
     if (savedIds === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;
     else process.env.OWNPLACE_IDENTITY_DIR = savedIds;
     client.close();
     await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("web composer posts as the logged-in Kinfolk only, to their porch only (#100)", async () => {
+  const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids });
+  try {
+    for (const body of [
+      { title: "t", body: "b", authorId: "kinfolk-sam" },
+      { title: "t", body: "b", authorId: "kinfolk-bob" },
+      { title: "t", body: "b", authorName: "Somebody Else" },
+    ]) {
+      assertError(await client.request("POST", "/api/post", JSON.stringify(body)), 400, {
+        error: "can only post as the logged-in Kinfolk",
+      });
+    }
+    const posted = await client.request("POST", "/api/post", JSON.stringify({ title: "Mine", body: "as alex" }));
+    assert.equal(posted.status, 201);
+    const result = posted.json as { authorId: string; backends: string[]; storyId: string };
+    assert.equal(result.authorId, "kinfolk-alex");
+    assert.deepEqual(result.backends, ["nextcloud-sim"]);
+    const nextcloud = await client.request("GET", "/api/timeline?backend=nextcloud-sim");
+    assert.deepEqual((nextcloud.json as { stories: { id: string }[] }).stories.map((s) => s.id), [result.storyId]);
+    const drive = await client.request("GET", "/api/timeline?backend=google-drive-sim");
+    assert.deepEqual((drive.json as { stories: unknown[] }).stories, [], "no mirror to Sam's porch");
+  } finally {
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+    await rm(ids, { recursive: true, force: true });
   }
 });
