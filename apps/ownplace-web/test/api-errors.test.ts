@@ -6,14 +6,15 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
-import { buildPackage, publishStory } from "@rooted/timeline";
+import { buildPackage, publishStory, readContactFollowedTimeline, validateContact, addContact } from "@rooted/timeline";
+import { LocalFolderStore } from "@rooted/storage";
 import http from "node:http";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const serverEntry = resolve(repoRoot, "apps/ownplace-web/src/server.ts");
 
 interface Client {
-  request(method: string, path: string, rawBody?: string): Promise<{ status: number; json: unknown }>;
+  request(method: string, path: string, rawBody?: string): Promise<{ status: number; json: unknown; raw: string }>;
   close(): void;
 }
 
@@ -89,7 +90,7 @@ async function boot(extraEnv: Record<string, string> = {}): Promise<{ child: Chi
     client: {
       request: async (method, path, rawBody) => {
         const r = await request(method, path, rawBody);
-        return { status: r.status, json: r.json };
+        return { status: r.status, json: r.json, raw: r.raw };
       },
       close: () => child.kill("SIGKILL"),
     },
@@ -310,7 +311,7 @@ test("web timeline merges local followed porches and isolates tamper (#76)", asy
       id: "porch-sam", displayName: "Sam", address: "local:porch-sam/nextcloud-sim",
     }))).status, 201);
     assert.equal((await client.request("POST", "/api/contacts", JSON.stringify({
-      id: "remote-jo", displayName: "Jo", address: "https://porch.example/jo",
+      id: "remote-jo", displayName: "Jo", address: "https://10.0.0.5/jo",
     }))).status, 201);
 
     const timeline = await client.request("GET", "/api/timeline?backend=nextcloud-sim");
@@ -322,7 +323,8 @@ test("web timeline merges local followed porches and isolates tamper (#76)", asy
     assert.deepEqual(body.stories.map((s) => s.id), ["story-alex-1", "story-sam-1", "story-own-1"]);
     assert.equal(body.stories.find((s) => s.id === "story-own-1")?.origin, "nextcloud-sim");
     assert.equal(body.stories.find((s) => s.id === "story-alex-1")?.origin, "porch-alex");
-    assert.ok(body.skipped.some((s) => s.reason === "remote porch not fetched"));
+    // M11 #90: private-range hosts are refused before any fetch.
+    assert.ok(body.skipped.some((s) => s.porch === "remote-jo" && s.reason === "remote porch refused"));
     assert.ok(!JSON.stringify(timeline.json).includes(tmp), "timeline leaked a store path");
 
     const story = await client.request("GET", "/api/story?backend=nextcloud-sim&id=story-alex-1");
@@ -366,5 +368,60 @@ test("web follow/unfollow round-trip keeps the porch address (#77)", async () =>
   } finally {
     client.close();
     await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("public porch route serves only package files and round-trips to a follower (#90)", async () => {
+  const { client, tmp } = await boot();
+  const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
+  process.env.OWNPLACE_IDENTITY_DIR = join(tmp, "ids");
+  const follower = await mkdtemp(resolve(tmpdir(), "rooted-follower-"));
+  try {
+    await publishStory(
+      { title: "Served", body: "over the porch route", authorId: "kinfolk-me", authorName: "Me" },
+      { root: tmp },
+      { createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-served-1" },
+    );
+    assert.equal((await client.request("POST", "/api/contacts", JSON.stringify({
+      id: "porch-alex", displayName: "Alex", address: "local:porch-alex/nextcloud-sim",
+    }))).status, 201);
+
+    const hint = await client.request("GET", "/porch/nextcloud-sim/timeline.json");
+    assert.equal(hint.status, 200);
+    assert.ok(((hint.json as { stories: { id: string }[] }).stories).some((s) => s.id === "story-served-1"));
+    for (const f of ["kinfolk.json", "story.json", "manifest.json", "signature.json"]) {
+      assert.equal((await client.request("GET", `/porch/nextcloud-sim/timeline/story-served-1/${f}`)).status, 200, f);
+    }
+    for (const bad of [
+      "/porch/nextcloud-sim/contacts.json",
+      "/porch/nextcloud-sim/timeline/story-served-1/other.json",
+      "/porch/nextcloud-sim/timeline/..%2F..%2Fcontacts.json/story.json",
+      "/porch/nextcloud-sim/timeline/../contacts.json",
+      "/porch/other-sim/timeline.json",
+      "/porch/nextcloud-sim/timeline/nope/story.json",
+      "/porch/nextcloud-sim/",
+    ]) {
+      const r = await client.request("GET", bad);
+      assert.equal(r.status, 404, bad);
+      assert.ok(!r.raw.includes("porch-alex"), `${bad} leaked contacts`);
+    }
+    assert.notEqual((await client.request("POST", "/porch/nextcloud-sim/timeline.json", "{}")).status, 200);
+
+    // A second instance follows this porch over the real route.
+    await addContact(new LocalFolderStore(join(follower, "nextcloud-sim")), validateContact({
+      id: "me-remote", displayName: "Me", address: "https://porch.test/porch/nextcloud-sim",
+    }));
+    const viaRoute = async (url: string): Promise<Response> => {
+      const r = await client.request("GET", url.replace("https://porch.test", ""));
+      return new Response(r.raw, { status: r.status });
+    };
+    const merged = await readContactFollowedTimeline(follower, "nextcloud-sim", "2026-09-28T00:05:00.000Z", "nextcloud-sim", { fetch: viaRoute });
+    assert.deepEqual(merged.stories.map((s) => [s.id, s.origin]), [["story-served-1", "me-remote"]]);
+  } finally {
+    if (savedIds === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;
+    else process.env.OWNPLACE_IDENTITY_DIR = savedIds;
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+    await rm(follower, { recursive: true, force: true });
   }
 });
