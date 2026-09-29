@@ -4,11 +4,15 @@
 // the logged-in operator is OPERATOR_KINFOLK and posts to their porch only.
 //
 // Endpoints:
-//   GET  /api/timeline?backend=nextcloud-sim        porch owner + porches it follows
+//   GET  /api/timeline?backend=nextcloud-sim        porch owner + porches it follows,
+//                                                   comments and wall posts attached (M15 #101)
 //   GET  /api/story?backend=B&id=ID                 verified history story
 //   POST /api/open  {backend?, id, readerKey, readerId?}  open sealed body+media
 //   GET  /api/contacts?backend=B                    that porch's contact list
 //   POST /api/post        {title, body}  (as the operator Kinfolk only)
+//   POST /api/post        {body, inReplyTo: {fingerprint, storyId}} | {body, to: {fingerprint}}
+//   DELETE /api/post?id=ID                          operator deletes own comment/wall post
+//   POST /api/hidden      {fingerprint, storyId}    operator hides a reply aimed at them
 //   POST /api/contacts    {id, displayName, address}  |  DELETE /api/contacts?id=ID
 //
 // Write auth: single-operator demo token via OWNPLACE_WRITE_TOKEN env.
@@ -26,13 +30,19 @@ import { readFile } from "node:fs/promises";
 import {
   addContact,
   backendsFromEnv,
+  checkReplyTarget,
+  deleteReply,
+  DELETE_REFUSED,
+  hideableReply,
+  hideReply,
+  isReplyTarget,
+  readThreadedTimeline,
   defaultRepoRoot,
   demoKinfolkFor,
   isSafeHistoryId,
   OPERATOR_KINFOLK,
   isSafeReaderId,
   publishStory,
-  readContactFollowedTimeline,
   readVerifiedFollowedStory,
   buildInviteDocument,
   porchIdentity,
@@ -210,13 +220,16 @@ const server = http.createServer(async (req, res) => {
       try {
         // M15 #100: each porch reads its own address book, so a column shows
         // its owner's posts plus the Kinfolk that owner follows. Followed
-        // porches are verified independently.
+        // porches are verified independently. M15 #101: comments and wall
+        // posts are attached to their targets; `owner` is the porch owner's
+        // key fingerprint (from verified posts) when there is exactly one.
         const now = new Date().toISOString();
-        const merged = await readContactFollowedTimeline(storesRoot, backend, now, backend);
+        const merged = await readThreadedTimeline(storesRoot, backend, now, backend);
         send(res, 200, {
           protocol: "rooted/v0.1",
           kind: "timeline",
           updatedAt: now,
+          ...(merged.owner ? { owner: merged.owner } : {}),
           stories: merged.stories,
           skipped: merged.skipped,
         });
@@ -385,13 +398,64 @@ const server = http.createServer(async (req, res) => {
           body: rec.body as string,
           authorId: operator.id,
           authorName: operator.displayName,
+          to: rec.to,
+          inReplyTo: rec.inReplyTo,
         });
+        // M15 #101: a comment names a post the operator can see; a wall
+        // post names someone the operator follows. Fixed messages only.
+        await checkReplyTarget(storesRoot, operatorPorch, validated);
       } catch (e) {
         send(res, 400, { error: (e as Error).message });
         return;
       }
       const result = await publishStory(validated, backendsFromEnv(repoRoot));
       send(res, 201, result);
+      return;
+    }
+    if (req.method === "DELETE" && pathname === "/api/post") {
+      if (!authorized(req)) {
+        send(res, 401, { error: "unauthorized" });
+        return;
+      }
+      // M15 #101: the operator deletes their own comment or wall post from
+      // their own porch; readers stop showing it on their next read.
+      const id = url.searchParams.get("id") ?? "";
+      try {
+        send(res, 200, await deleteReply(operator.id, id, backendsFromEnv(repoRoot)));
+      } catch (e) {
+        const message = (e as Error).message;
+        if (message === DELETE_REFUSED.notReply) send(res, 400, { error: message });
+        else if (message === DELETE_REFUSED.missing) send(res, 404, { error: message });
+        else throw e;
+      }
+      return;
+    }
+    if (req.method === "POST" && pathname === "/api/hidden") {
+      if (!authorized(req)) {
+        send(res, 401, { error: "unauthorized" });
+        return;
+      }
+      let input: unknown;
+      try {
+        input = await readJsonBody(req);
+      } catch {
+        send(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      if (!isReplyTarget(input)) {
+        send(res, 400, { error: "bad reply" });
+        return;
+      }
+      // M15 #101: the operator hides, on their own porch only, someone
+      // else's reply aimed at them. Nothing is changed on the author's porch.
+      const view = await readThreadedTimeline(storesRoot, operatorPorch, new Date().toISOString(), operatorPorch);
+      const target = hideableReply(view, input);
+      if (!target) {
+        send(res, 404, { error: "not found" });
+        return;
+      }
+      await hideReply(simStore(operatorPorch), target);
+      send(res, 201, target);
       return;
     }
     if (req.method === "POST" && pathname === "/api/contacts/invite") {

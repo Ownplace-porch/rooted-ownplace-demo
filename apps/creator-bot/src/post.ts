@@ -2,9 +2,22 @@
 // Slice-1 paid gating: --entitle-reader ID plus --reader-pubkey FILE seals the body for one reader; default posts stay public.
 // Slice-3 paid gating: --entitle-readers JSONFILE seals for N readers at once (JSON array of
 // {readerId, pubkeyFile} or {readerId, publicKey}); combines with the legacy single-reader flags.
+// M15 #101: --reply-to STORY_ID comments on a post the author can see; --wall CONTACT_ID
+// writes on a followed Kinfolk's wall. Both publish to the author's own porch, public only.
 
 import { readFileSync } from "node:fs";
-import { defaultRepoRoot, backendsFromEnv, demoKinfolkFor, NO_PORCH, publishStory, validateInput } from "@rooted/timeline";
+import {
+  defaultRepoRoot,
+  backendsFromEnv,
+  checkReplyTarget,
+  commentTargetFor,
+  demoKinfolkFor,
+  NO_PORCH,
+  OPERATOR_KINFOLK,
+  publishStory,
+  validateInput,
+  wallTargetFor,
+} from "@rooted/timeline";
 
 function arg(name: string): string | undefined {
   const idx = process.argv.indexOf(`--${name}`);
@@ -14,7 +27,7 @@ function arg(name: string): string | undefined {
   return value;
 }
 
-const USAGE = 'usage: npm run post -- --title "TITLE" --body "BODY" [--author-id kinfolk-alex|kinfolk-sam] [--author-name NAME] [--members-only] [--entitle-reader ID --reader-pubkey FILE] [--entitle-readers JSONFILE]';
+const USAGE = 'usage: npm run post -- --title "TITLE" --body "BODY" [--author-id kinfolk-alex|kinfolk-sam] [--author-name NAME] [--reply-to STORY_ID | --wall CONTACT_ID] [--members-only] [--entitle-reader ID --reader-pubkey FILE] [--entitle-readers JSONFILE]';
 
 function fail(message: string): never {
   console.error(`post failed: ${message}`);
@@ -26,13 +39,36 @@ function isSafeId(id: unknown): id is string {
   return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) && !id.includes("..");
 }
 
+const backends = backendsFromEnv(defaultRepoRoot());
+const replyTo = arg("reply-to");
+const wall = arg("wall");
+if (replyTo !== undefined && wall !== undefined) fail("a post is either a comment or a wall post, not both");
+
+// M15 #101: targets resolve from the author's own porch: a comment's post
+// must be in their threaded view, a wall's Kinfolk in their pinned contacts.
+// Replies need no --title.
+let target: { to?: Awaited<ReturnType<typeof wallTargetFor>>; inReplyTo?: Awaited<ReturnType<typeof commentTargetFor>> } = {};
+if (replyTo !== undefined || wall !== undefined) {
+  const author = demoKinfolkFor((arg("author-id") ?? OPERATOR_KINFOLK).trim());
+  if (!author) fail(NO_PORCH);
+  try {
+    target = replyTo !== undefined
+      ? { inReplyTo: await commentTargetFor(backends.root, author.porch, replyTo) }
+      : { to: await wallTargetFor(backends.root, author.porch, wall!) };
+    await checkReplyTarget(backends.root, author.porch, target);
+  } catch (e) {
+    fail((e as Error).message);
+  }
+}
+
 let validated;
 try {
   validated = validateInput({
-    title: arg("title") ?? "",
+    title: arg("title") ?? (target.to || target.inReplyTo ? undefined : ""),
     body: arg("body") ?? "",
     authorId: arg("author-id"),
     authorName: arg("author-name"),
+    ...target,
   });
 } catch (e) {
   console.error(`post failed: ${(e as Error).message}`);
@@ -113,5 +149,6 @@ if (entitleReadersFile !== undefined) {
   entitleReaders = batch;
 }
 const membersOnly = process.argv.includes("--members-only");
-const res = await publishStory(validated, backendsFromEnv(defaultRepoRoot()), { entitle, entitleReaders, membersOnly });
+if ((validated.to || validated.inReplyTo) && (membersOnly || entitle || entitleReaders)) fail("comments and wall posts are public in this slice");
+const res = await publishStory(validated, backends, { entitle, entitleReaders, membersOnly });
 console.log(`done: ${res.backends.join(", ")} story=${res.storyId} author=${res.authorId}`);

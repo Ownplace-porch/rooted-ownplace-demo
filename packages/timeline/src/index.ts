@@ -15,7 +15,9 @@ import {
   verifyManifestSignature,
   objectBytes,
   type Kinfolk,
+  type ReplyTarget,
   type Story,
+  type WallTarget,
 } from "@rooted/protocol";
 import { identityFingerprint, isFingerprint, isMediaList, isSafeReaderId, isSealedBody, loadOrCreateEncryptionIdentity, sealBodyForReaders, sealGatedContent, tryOpenBody } from "@rooted/protocol";
 // Re-exported for the web reader gate (M8 #66): same reader-id rule server-side.
@@ -38,6 +40,15 @@ export interface TimelineEntry {
   // Follow-model broadcast (M10 demo): which porch an entry was pulled
   // from. Own-porch reads leave it unset; merged reads set it.
   origin?: string;
+  // M15 #101: fingerprint of the verified signer, and the signed target of
+  // a wall post (`to`) or comment (`inReplyTo`). Sealed posts are flagged
+  // so replies to them can be refused (sealed replies are not in this slice).
+  signer?: string;
+  to?: WallTarget;
+  inReplyTo?: ReplyTarget;
+  sealed?: true;
+  // Set only by threadTimeline: verified comments, oldest first.
+  comments?: TimelineEntry[];
 }
 export interface TimelineIndex {
   protocol: "rooted/v0.1";
@@ -67,12 +78,16 @@ export interface ContactList {
 }
 
 export interface StoryInput {
-  title: string;
+  // M15 #101: optional for comments and wall posts only (checked at runtime).
+  title?: string;
   body: string;
   media?: string[];
   authorId?: string;
   authorName?: string;
   createdAt?: string;
+  // M15 #101: at most one of these; see threadTimeline.
+  to?: unknown;
+  inReplyTo?: unknown;
 }
 
 export interface PublishResult {
@@ -114,8 +129,40 @@ const DEFAULT_PORCH: Pick<DemoKinfolk, "porch" | "cloud"> = { porch: "nextcloud-
 export const TITLE_MAX = 140;
 export const BODY_MAX = 5000;
 
-export function validateInput(input: StoryInput): { title: string; body: string; media: string[]; authorId: string; authorName: string } {
-  const { title, body } = input;
+// M15 #101: replies carry exactly the target fields, nothing else.
+export function isWallTarget(value: unknown): value is WallTarget {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const t = value as Record<string, unknown>;
+  return Object.keys(t).length === 1 && isFingerprint(t.fingerprint);
+}
+
+export function isReplyTarget(value: unknown): value is ReplyTarget {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const t = value as Record<string, unknown>;
+  return Object.keys(t).length === 2 && isFingerprint(t.fingerprint) &&
+    typeof t.storyId === "string" && isSafeHistoryId(t.storyId);
+}
+
+export const REPLY_TITLES = { comment: "Comment", wall: "Wall post" } as const;
+
+export interface ValidatedStory {
+  title: string;
+  body: string;
+  media: string[];
+  authorId: string;
+  authorName: string;
+  to?: WallTarget;
+  inReplyTo?: ReplyTarget;
+}
+
+export function validateInput(input: StoryInput): ValidatedStory {
+  // M15 #101: a comment or wall post needs no title; it gets a fixed one.
+  if (input.to !== undefined && input.inReplyTo !== undefined) throw new Error("a post is either a comment or a wall post, not both");
+  if (input.to !== undefined && !isWallTarget(input.to)) throw new Error("wall target must be a key fingerprint");
+  if (input.inReplyTo !== undefined && !isReplyTarget(input.inReplyTo)) throw new Error("comment target must be a key fingerprint and story id");
+  const replyTitle = input.inReplyTo !== undefined ? REPLY_TITLES.comment : input.to !== undefined ? REPLY_TITLES.wall : undefined;
+  const title = replyTitle !== undefined && (input.title === undefined || input.title === "") ? replyTitle : input.title;
+  const { body } = input;
   if (typeof title !== "string" || !title.trim() || typeof body !== "string" || !body.trim()) {
     throw new Error("title and body are required and must be non-empty");
   }
@@ -141,7 +188,10 @@ export function validateInput(input: StoryInput): { title: string; body: string;
   // media empty as before.
   const media = input.media === undefined ? [] : input.media;
   if (!isMediaList(media)) throw new Error("media must be a list of at most 8 https URLs");
-  return { title: cleanTitle, body: cleanBody, media, authorId, authorName };
+  const out: ValidatedStory = { title: cleanTitle, body: cleanBody, media, authorId, authorName };
+  if (isWallTarget(input.to)) out.to = { fingerprint: input.to.fingerprint };
+  if (isReplyTarget(input.inReplyTo)) out.inReplyTo = { fingerprint: input.inReplyTo.fingerprint, storyId: input.inReplyTo.storyId };
+  return out;
 }
 
 export function isEntry(s: unknown): s is TimelineEntry {
@@ -284,6 +334,7 @@ export function toPublicSkipReason(rawReason: string): string {
     if (part.includes("not Ed25519 signed")) return "not Ed25519 signed";
     if (part.includes("signature is malformed")) return "invalid signature";
     if (part.includes("entitlements")) return "invalid entitlements";
+    if (part.includes("reply target")) return "malformed reply target";
     if (part.includes("manifest")) return "invalid manifest";
     if (part.includes("story author does not match")) return "author mismatch";
     if (part.includes("incomplete package")) return "incomplete package";
@@ -346,6 +397,14 @@ export async function fetchVerifiedHistoryPackage(store: ObjectStore, id: string
       const media = (storyDoc as { media?: unknown }).media;
       if (!Array.isArray(media) || media.length !== 0) problems.push("gated package contains plaintext media");
     }
+  }
+  // M15 #101: reply targets are signed story fields; a malformed one (or a
+  // package that is both a comment and a wall post) fails closed.
+  if (storyDoc) {
+    const reply = storyDoc as { to?: unknown; inReplyTo?: unknown };
+    if (reply.to !== undefined && !isWallTarget(reply.to)) problems.push("malformed reply target: to");
+    if (reply.inReplyTo !== undefined && !isReplyTarget(reply.inReplyTo)) problems.push("malformed reply target: inReplyTo");
+    if (reply.to !== undefined && reply.inReplyTo !== undefined) problems.push("malformed reply target: both to and inReplyTo");
   }
   // Entitlements binding (slice 3): gated packages must list the sidecar in
   // the manifest exactly once (hash-checked by the generic manifest loop
@@ -456,7 +515,7 @@ export async function readAuthenticatedTimeline(
           !Number.isNaN(Date.parse(story.createdAt))) {
         // Directory, story, and manifest ids already agree (enforced in
         // fetchVerifiedHistoryPackage); the directory id is authoritative.
-        entries.push({ id, title: story.title, authorId: story.authorId, createdAt: story.createdAt, verified: true });
+        entries.push(entryFor(pkg, id));
       } else {
         skipped.push({ id, reason: "verified package has malformed story fields" });
       }
@@ -476,6 +535,23 @@ export async function readAuthenticatedTimeline(
   // local absolute paths). Internal `skipped` keeps full diagnostics.
   const publicSkipped = skipped.map((s) => ({ id: s.id, reason: toPublicSkipReason(s.reason) }));
   return { index: { protocol: "rooted/v0.1", kind: "timeline", updatedAt: now, stories: entries, skipped: publicSkipped }, skipped };
+}
+
+// M15 #101: the signer fingerprint and reply fields come from the verified
+// package only; an unparseable key leaves the entry without a signer, so
+// nothing can be attached to it.
+function entryFor(pkg: VerifiedHistoryPackage, id: string): TimelineEntry {
+  const story = pkg.story;
+  const entry: TimelineEntry = { id, title: story.title, authorId: story.authorId, createdAt: story.createdAt, verified: true };
+  try {
+    entry.signer = identityFingerprint(pkg.kinfolk.publicKey ?? "");
+  } catch {
+    // No signer: shown as a plain post, never threaded.
+  }
+  if (story.to) entry.to = { fingerprint: story.to.fingerprint };
+  if (story.inReplyTo) entry.inReplyTo = { fingerprint: story.inReplyTo.fingerprint, storyId: story.inReplyTo.storyId };
+  if (story.restricted !== undefined) entry.sealed = true;
+  return entry;
 }
 
 export interface FollowedPorch {
@@ -733,6 +809,22 @@ async function followMovedPorches(
   return moved;
 }
 
+async function readContactFollowed(
+  storesRoot: string,
+  ownLabel: string,
+  now: string,
+  contactsLabel: string,
+  opts: FollowOptions,
+): Promise<{ stories: TimelineEntry[]; skipped: { porch: string; id: string; reason: string }[]; contactsStore: ObjectStore | null }> {
+  const { porches, skipped, contactsStore } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel, opts);
+  const toFollowed = () => porches.map((porch) => ({ label: porch.label, store: porch.store, pin: porch.pin }));
+  let merged = await readFollowedTimelines(toFollowed(), now);
+  if (await followMovedPorches(porches, merged, contactsStore, opts)) {
+    merged = await readFollowedTimelines(toFollowed(), now);
+  }
+  return { stories: merged.stories, skipped: [...skipped, ...merged.skipped], contactsStore };
+}
+
 export async function readContactFollowedTimeline(
   storesRoot: string,
   ownLabel: string,
@@ -740,13 +832,171 @@ export async function readContactFollowedTimeline(
   contactsLabel: string = ownLabel,
   opts: FollowOptions = {},
 ): Promise<{ stories: TimelineEntry[]; skipped: { porch: string; id: string; reason: string }[] }> {
-  const { porches, skipped, contactsStore } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel, opts);
-  const toFollowed = () => porches.map((porch) => ({ label: porch.label, store: porch.store, pin: porch.pin }));
-  let merged = await readFollowedTimelines(toFollowed(), now);
-  if (await followMovedPorches(porches, merged, contactsStore, opts)) {
-    merged = await readFollowedTimelines(toFollowed(), now);
+  const { stories, skipped } = await readContactFollowed(storesRoot, ownLabel, now, contactsLabel, opts);
+  return { stories, skipped };
+}
+
+// --- Wall posts and comments (M15 #101) ---
+// A wall post (`to`) and a comment (`inReplyTo`) are ordinary signed posts
+// on their author's own porch. Nothing is written to anyone else's storage.
+// A reader attaches them while merging the porches it already follows:
+// - the porch owner is the one key that signed every verified post on the
+//   reader's own porch (no single signer: no owner, no wall posts shown);
+// - wall posts show only when they name the owner, as top-level entries;
+// - comments attach under the top-level entry whose signer and id they
+//   name, oldest first; a comment whose target is not in the read is dropped;
+// - replies never attach to sealed posts, and sealed replies are dropped
+//   (sealing replies to the same readers is not in this slice);
+// - replies the owner hid (hidden.json on their own porch) are dropped.
+// Everything here comes from verified entries: a pinned porch's signer rule
+// (M13) has already removed replies signed by anyone else.
+
+export interface HiddenReply { fingerprint: string; storyId: string; hiddenAt: string }
+export interface HiddenList { protocol: "rooted/v0.1"; kind: "hidden"; updatedAt: string; hidden: HiddenReply[] }
+
+const HIDDEN_FILE = "hidden.json";
+
+export function porchOwner(stories: TimelineEntry[], ownLabel: string): string | undefined {
+  const signers = new Set(stories.filter((s) => s.origin === ownLabel).map((s) => s.signer));
+  const [only] = [...signers];
+  return signers.size === 1 && typeof only === "string" ? only : undefined;
+}
+
+function replyKey(fingerprint: string, storyId: string): string {
+  return `${fingerprint}/${storyId}`;
+}
+
+export function threadTimeline(
+  stories: TimelineEntry[],
+  ownLabel: string,
+  hidden: { fingerprint: string; storyId: string }[] = [],
+): { owner?: string; stories: TimelineEntry[] } {
+  const owner = porchOwner(stories, ownLabel);
+  const hiddenKeys = new Set(hidden.map((h) => replyKey(h.fingerprint, h.storyId)));
+  const isHidden = (s: TimelineEntry) => s.signer !== undefined && hiddenKeys.has(replyKey(s.signer, s.id));
+  const top: TimelineEntry[] = [];
+  const byKey = new Map<string, TimelineEntry>();
+  for (const s of stories) {
+    if (s.inReplyTo) continue;
+    if (s.to && (s.sealed || owner === undefined || s.to.fingerprint !== owner || isHidden(s))) continue;
+    const entry: TimelineEntry = { ...s, comments: [] };
+    top.push(entry);
+    if (s.signer) byKey.set(replyKey(s.signer, s.id), entry);
   }
-  return { stories: merged.stories, skipped: [...skipped, ...merged.skipped] };
+  for (const s of stories) {
+    if (!s.inReplyTo || s.sealed || isHidden(s)) continue;
+    const target = byKey.get(replyKey(s.inReplyTo.fingerprint, s.inReplyTo.storyId));
+    if (!target || target.sealed) continue;
+    target.comments!.push({ ...s });
+  }
+  for (const entry of top) {
+    entry.comments!.sort((a, b) => a.createdAt.localeCompare(b.createdAt) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  }
+  return owner === undefined ? { stories: top } : { owner, stories: top };
+}
+
+export async function readHidden(store: ObjectStore): Promise<HiddenList> {
+  try {
+    const parsed = JSON.parse(new TextDecoder().decode(await store.readObject(HIDDEN_FILE))) as Partial<HiddenList>;
+    if (parsed && Array.isArray(parsed.hidden)) {
+      const hidden = parsed.hidden.flatMap((h): HiddenReply[] => {
+        if (!h || !isFingerprint(h.fingerprint) || typeof h.storyId !== "string" || !isSafeHistoryId(h.storyId)) return [];
+        return [{ fingerprint: h.fingerprint, storyId: h.storyId, hiddenAt: typeof h.hiddenAt === "string" ? h.hiddenAt : "" }];
+      });
+      return { protocol: "rooted/v0.1", kind: "hidden", updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : "", hidden };
+    }
+  } catch {
+    // missing/unreadable: nothing hidden
+  }
+  return { protocol: "rooted/v0.1", kind: "hidden", updatedAt: new Date().toISOString(), hidden: [] };
+}
+
+export async function hideReply(store: ObjectStore, target: ReplyTarget): Promise<HiddenList> {
+  if (!isReplyTarget(target)) throw new Error("bad reply");
+  const list = await readHidden(store);
+  const now = new Date().toISOString();
+  if (!list.hidden.some((h) => h.fingerprint === target.fingerprint && h.storyId === target.storyId)) {
+    list.hidden.push({ fingerprint: target.fingerprint, storyId: target.storyId, hiddenAt: now });
+  }
+  list.updatedAt = now;
+  await store.writeObject(HIDDEN_FILE, new TextEncoder().encode(`${JSON.stringify(list)}\n`));
+  return list;
+}
+
+// The reader's merged, threaded view: own porch plus its follows, with the
+// hide list read from the same porch as the address book.
+export async function readThreadedTimeline(
+  storesRoot: string,
+  ownLabel: string,
+  now: string,
+  contactsLabel: string = ownLabel,
+  opts: FollowOptions = {},
+): Promise<{ owner?: string; stories: TimelineEntry[]; skipped: { porch: string; id: string; reason: string }[] }> {
+  const merged = await readContactFollowed(storesRoot, ownLabel, now, contactsLabel, opts);
+  const hidden = merged.contactsStore ? (await readHidden(merged.contactsStore)).hidden : [];
+  return { ...threadTimeline(merged.stories, ownLabel, hidden), skipped: merged.skipped };
+}
+
+// Fixed, public-safe refusals for a reply the author cannot make.
+export const REPLY_REFUSED = {
+  comment: "can only comment on a post you can see",
+  sealed: "comments on Kinfolk-only posts are not available yet",
+  wall: "can only write on the wall of a Kinfolk you follow",
+} as const;
+
+// Before signing, a comment must name a top-level post in the author's own
+// threaded view, and a wall post must name the pinned key of someone the
+// author follows. Both refuse sealed or unknown targets.
+export async function checkReplyTarget(
+  storesRoot: string,
+  ownLabel: string,
+  target: { to?: WallTarget; inReplyTo?: ReplyTarget },
+  opts: FollowOptions = {},
+): Promise<void> {
+  if (target.inReplyTo) {
+    const view = await readThreadedTimeline(storesRoot, ownLabel, new Date().toISOString(), ownLabel, opts);
+    const post = view.stories.find((s) => s.signer === target.inReplyTo!.fingerprint && s.id === target.inReplyTo!.storyId);
+    if (!post) throw new Error(REPLY_REFUSED.comment);
+    if (post.sealed) throw new Error(REPLY_REFUSED.sealed);
+  }
+  if (target.to) {
+    const loc = await locatePorch(storesRoot, ownLabel);
+    const contacts = loc.kind === "ok" ? (await readContacts(new LocalFolderStore(loc.path))).contacts : [];
+    if (!contacts.some((c) => c.fingerprint === target.to!.fingerprint)) throw new Error(REPLY_REFUSED.wall);
+  }
+}
+
+// CLI helpers: name a comment target by story id, a wall by contact id.
+export async function commentTargetFor(storesRoot: string, ownLabel: string, storyId: string, opts: FollowOptions = {}): Promise<ReplyTarget> {
+  const view = await readThreadedTimeline(storesRoot, ownLabel, new Date().toISOString(), ownLabel, opts);
+  const post = view.stories.find((s) => s.id === storyId);
+  if (!post?.signer) throw new Error(REPLY_REFUSED.comment);
+  return { fingerprint: post.signer, storyId };
+}
+
+export async function wallTargetFor(storesRoot: string, ownLabel: string, contactId: string): Promise<WallTarget> {
+  const loc = await locatePorch(storesRoot, ownLabel);
+  const contacts = loc.kind === "ok" ? (await readContacts(new LocalFolderStore(loc.path))).contacts : [];
+  const contact = contacts.find((c) => c.id === contactId);
+  if (!contact || !isFingerprint(contact.fingerprint)) throw new Error(REPLY_REFUSED.wall);
+  return { fingerprint: contact.fingerprint };
+}
+
+// The owner may hide someone else's reply that targets them: a wall post on
+// their wall, or a comment under one of their posts. Returns the target to
+// store, or null when the view shows no such reply.
+export function hideableReply(
+  view: { owner?: string; stories: TimelineEntry[] },
+  target: ReplyTarget,
+): ReplyTarget | null {
+  const { owner } = view;
+  if (!owner || target.fingerprint === owner) return null;
+  const matches = (s: TimelineEntry) => s.signer === target.fingerprint && s.id === target.storyId;
+  for (const s of view.stories) {
+    if (s.to && matches(s)) return { fingerprint: target.fingerprint, storyId: target.storyId };
+    if (s.signer === owner && (s.comments ?? []).some(matches)) return { fingerprint: target.fingerprint, storyId: target.storyId };
+  }
+  return null;
 }
 
 export async function readVerifiedFollowedStory(
@@ -790,7 +1040,9 @@ export interface EntitleReader {
   readerPublicKey: string;
 }
 
-export function buildPackage(input: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string; createdAt: string; storyId: string }, opts: { entitle?: EntitleReader; entitleReaders?: EntitleReader[] } = {}) {
+export const SEALED_REPLY = "comments and wall posts are public in this slice";
+
+export function buildPackage(input: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string; createdAt: string; storyId: string; to?: WallTarget; inReplyTo?: ReplyTarget }, opts: { entitle?: EntitleReader; entitleReaders?: EntitleReader[] } = {}) {
   const identity = loadOrCreateIdentity(input.authorId);
   const kinfolk: Kinfolk = { id: input.authorId, displayName: input.authorName, publicKey: identity.publicKey };
   // M15 #100: the seed publisher signs the bio the invite panel shows.
@@ -803,7 +1055,12 @@ export function buildPackage(input: { title: string; body: string; media?: strin
     authorId: kinfolk.id,
     createdAt: input.createdAt,
   };
+  // M15 #101: the reply target is signed with the story.
+  if (input.to && input.inReplyTo) throw new Error("a post is either a comment or a wall post, not both");
+  if (input.to) story.to = { fingerprint: input.to.fingerprint };
+  if (input.inReplyTo) story.inReplyTo = { fingerprint: input.inReplyTo.fingerprint, storyId: input.inReplyTo.storyId };
   const readers: EntitleReader[] = [...(opts.entitleReaders ?? []), ...(opts.entitle ? [opts.entitle] : [])];
+  if (readers.length > 0 && (story.to || story.inReplyTo)) throw new Error(SEALED_REPLY);
   // M4 cross-check + Slice-3 sidecar (ids only, no keys/secrets). Signed via
   // the manifest like kinfolk/story so readers can discover entitlement
   // without trial-decrypt. Combine legacy `entitle` + batch `entitleReaders`
@@ -909,7 +1166,7 @@ export function backendsFromEnv(repoRoot: string): BackendSet {
 
 /** Publish one validated story to its author's porch and that porch's cloud. */
 export async function publishStory(
-  validated: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string },
+  validated: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string; to?: WallTarget; inReplyTo?: ReplyTarget },
   backends: BackendSet,
   opts: { createdAt?: string; storyId?: string; entitle?: EntitleReader; entitleReaders?: EntitleReader[]; membersOnly?: boolean } = {}
 ): Promise<PublishResult> {
@@ -956,6 +1213,90 @@ export async function publishStory(
   }
 
   return { storyId, authorId: validated.authorId, backends: published, skipped };
+}
+
+// --- Deleting a reply (M15 #101) ---
+// An author deletes their own comment or wall post from their own porch
+// (and that porch's cloud). Readers stop seeing it on their next read,
+// since they only ever show what the author's porch still serves. Plain
+// posts are not deletable in this slice.
+export const DELETE_REFUSED = { missing: "not found", notReply: "only comments and wall posts can be deleted" } as const;
+
+async function removeFromTimeline(label: string, store: ObjectStore, storyId: string, now: string): Promise<void> {
+  for (const name of KNOWN_PACKAGE_FILES) await store.deleteObject(`timeline/${storyId}/${name}`);
+  // The flat "latest" copy must not keep the deleted words: point it at the
+  // newest remaining package, or clear it when none is left.
+  const index = await readIndex(store, label, now);
+  let flatId: unknown;
+  try {
+    flatId = (JSON.parse(new TextDecoder().decode(await store.readObject("story.json"))) as { id?: unknown }).id;
+  } catch {
+    flatId = undefined;
+  }
+  if (flatId === storyId) {
+    const newest = index.stories[0]?.id;
+    for (const name of KNOWN_PACKAGE_FILES) {
+      let bytes: Uint8Array | undefined;
+      if (newest) {
+        try {
+          bytes = await store.readObject(`timeline/${newest}/${name}`);
+        } catch {
+          bytes = undefined;
+        }
+      }
+      if (bytes) await store.writeObject(name, bytes);
+      else await store.deleteObject(name);
+    }
+  }
+  await store.writeObject("timeline.json", new TextEncoder().encode(`${JSON.stringify(index)}\n`));
+  console.log(`deleted ${storyId} from ${label}`);
+}
+
+export async function deleteReply(
+  authorId: string,
+  storyId: string,
+  backends: BackendSet,
+  opts: { now?: string } = {},
+): Promise<PublishResult> {
+  if (!isSafeHistoryId(storyId)) throw new Error(DELETE_REFUSED.missing);
+  const home = demoKinfolkFor(authorId) ?? DEFAULT_PORCH;
+  const now = opts.now ?? new Date().toISOString();
+  const store = new LocalFolderStore(resolve(backends.root, home.porch));
+  let pkg: VerifiedHistoryPackage;
+  try {
+    pkg = await fetchVerifiedHistoryPackage(store, storyId);
+  } catch {
+    throw new Error(DELETE_REFUSED.missing);
+  }
+  // Only the author's own reply, signed by the author's own key.
+  if (pkg.story.authorId !== authorId || !signerMatches(pkg, identityFingerprint(loadOrCreateIdentity(authorId).publicKey))) {
+    throw new Error(DELETE_REFUSED.missing);
+  }
+  if (!pkg.story.to && !pkg.story.inReplyTo) throw new Error(DELETE_REFUSED.notReply);
+  const published: string[] = [];
+  const skipped: string[] = [];
+  await removeFromTimeline(home.porch, store, storyId, now);
+  published.push(home.porch);
+
+  if (home.cloud === "kevcloud" && backends.kevcloud) {
+    await removeFromTimeline("kevcloud (WebDAV)", new WebDavStore({ ...backends.kevcloud }), storyId, now);
+    published.push("kevcloud");
+  } else {
+    skipped.push("kevcloud");
+  }
+
+  if (home.cloud === "google-drive" && backends.drive) {
+    // rclone copy never deletes: purge this package's folder, then copy the
+    // porch again so the flat latest copy and timeline.json match.
+    const remote = `${backends.drive.remote}${backends.drive.folder}`;
+    await run("rclone", ["purge", `${remote}/timeline/${storyId}`, "--timeout", "30s"], { timeout: 90000 });
+    await run("rclone", ["copy", resolve(backends.root, home.porch) + "/", `${remote}/`, "--timeout", "30s"], { timeout: 90000 });
+    console.log(`deleted ${storyId} from google-drive (rclone ${remote}/)`);
+    published.push("google-drive");
+  } else {
+    skipped.push("google-drive");
+  }
+  return { storyId, authorId, backends: published, skipped };
 }
 
 // --- Contacts (syndication address book) ---

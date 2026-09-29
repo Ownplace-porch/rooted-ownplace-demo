@@ -6,6 +6,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
+import { identityFingerprint, loadOrCreateIdentity } from "@rooted/protocol";
 import { buildPackage, publishStory, readContactFollowedTimeline, validateContact, addContact } from "@rooted/timeline";
 import { LocalFolderStore } from "@rooted/storage";
 import http from "node:http";
@@ -569,5 +570,96 @@ test("web composer posts as the logged-in Kinfolk only, to their porch only (#10
     client.close();
     await rm(tmp, { recursive: true, force: true });
     await rm(ids, { recursive: true, force: true });
+  }
+});
+
+// M15 #101: comments and wall posts publish to the operator's own porch,
+// attach on read, and delete/hide with fixed, leak-free errors.
+test("web comments, wall posts, delete and hide between Alex and Sam (#101)", async () => {
+  const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids });
+  const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
+  process.env.OWNPLACE_IDENTITY_DIR = ids;
+  try {
+    const fp = (id: string) => identityFingerprint(loadOrCreateIdentity(id).publicKey);
+    await publishStory({ title: "Alex post", body: "from alex", authorId: "kinfolk-alex", authorName: "Alex Rowan" }, { root: tmp },
+      { createdAt: "2026-09-29T09:00:00.000Z", storyId: "story-alex-1" });
+    await publishStory({ title: "Sam post", body: "from sam", authorId: "kinfolk-sam", authorName: "Sam" }, { root: tmp },
+      { createdAt: "2026-09-29T10:00:00.000Z", storyId: "story-sam-1" });
+    await addContact(new LocalFolderStore(join(tmp, "nextcloud-sim")), {
+      id: "kinfolk-sam", displayName: "Sam", addedAt: "2026-09-29T00:00:00.000Z", address: "local:google-drive-sim", fingerprint: fp("kinfolk-sam"),
+    });
+    await addContact(new LocalFolderStore(join(tmp, "google-drive-sim")), {
+      id: "kinfolk-alex", displayName: "Alex Rowan", addedAt: "2026-09-29T00:00:00.000Z", address: "local:nextcloud-sim", fingerprint: fp("kinfolk-alex"),
+    });
+    const post = (body: unknown) => client.request("POST", "/api/post", JSON.stringify(body));
+
+    // Alex comments on Sam's post and writes on Sam's wall.
+    const comment = await post({ body: "hi sam", inReplyTo: { fingerprint: fp("kinfolk-sam"), storyId: "story-sam-1" } });
+    assert.equal(comment.status, 201);
+    const commentId = (comment.json as { storyId: string }).storyId;
+    assert.deepEqual((comment.json as { backends: string[] }).backends, ["nextcloud-sim"]);
+    const wall = await post({ body: "on your wall", to: { fingerprint: fp("kinfolk-sam") } });
+    assert.equal(wall.status, 201);
+    const wallId = (wall.json as { storyId: string }).storyId;
+
+    type Entry = { id: string; origin?: string; to?: unknown; comments?: { id: string; origin?: string }[] };
+    const timeline = async (backend: string) => (await client.request("GET", `/api/timeline?backend=${backend}`)).json as { owner?: string; stories: Entry[] };
+    const sam = await timeline("google-drive-sim");
+    assert.equal(sam.owner, fp("kinfolk-sam"));
+    assert.deepEqual(sam.stories.find((s) => s.id === "story-sam-1")?.comments?.map((c) => [c.id, c.origin]), [[commentId, "kinfolk-alex"]]);
+    assert.deepEqual(sam.stories.find((s) => s.id === wallId)?.to, { fingerprint: fp("kinfolk-sam") });
+    const alex = await timeline("nextcloud-sim");
+    assert.equal(alex.owner, fp("kinfolk-alex"));
+    assert.ok(!alex.stories.some((s) => s.id === wallId), "Sam's wall is not shown on Alex's column");
+    assert.ok(!alex.stories.some((s) => s.id === commentId), "a comment is not a plain post");
+    assert.equal(((await client.request("GET", `/api/story?backend=google-drive-sim&id=${commentId}`)).json as { body: string }).body, "hi sam");
+
+    // Refusals: fixed messages, no internals.
+    const stranger = "c".repeat(64);
+    assertError(await post({ body: "x", to: { fingerprint: stranger } }), 400, { error: "can only write on the wall of a Kinfolk you follow" });
+    assertError(await post({ body: "x", inReplyTo: { fingerprint: fp("kinfolk-sam"), storyId: "story-nope" } }), 400, { error: "can only comment on a post you can see" });
+    assertError(await post({ body: "x", inReplyTo: { fingerprint: "nope", storyId: "story-sam-1" } }), 400, { error: "comment target must be a key fingerprint and story id" });
+    assertError(await post({ body: "x", to: { fingerprint: stranger }, inReplyTo: { fingerprint: stranger, storyId: "s" } }), 400, { error: "a post is either a comment or a wall post, not both" });
+    assertError(await post({ body: "x" }), 400, { error: "title and body are required and must be non-empty" });
+
+    // Sam comments on Alex's post (Sam's porch); Alex hides it locally.
+    await publishStory({ title: "Comment", body: "from sam", authorId: "kinfolk-sam", authorName: "Sam", inReplyTo: { fingerprint: fp("kinfolk-alex"), storyId: "story-alex-1" } },
+      { root: tmp }, { createdAt: "2026-09-29T11:00:00.000Z", storyId: "story-sam-c1" });
+    assert.deepEqual((await timeline("nextcloud-sim")).stories.find((s) => s.id === "story-alex-1")?.comments?.map((c) => c.id), ["story-sam-c1"]);
+    assertError(await client.request("POST", "/api/hidden", JSON.stringify({ fingerprint: fp("kinfolk-alex"), storyId: commentId })), 404, { error: "not found" });
+    assertError(await client.request("POST", "/api/hidden", JSON.stringify({ fingerprint: "x", storyId: "story-sam-c1" })), 400, { error: "bad reply" });
+    assertError(await client.request("POST", "/api/hidden", "{not json"), 400, { error: "invalid JSON body" });
+    const hid = await client.request("POST", "/api/hidden", JSON.stringify({ fingerprint: fp("kinfolk-sam"), storyId: "story-sam-c1" }));
+    assert.equal(hid.status, 201);
+    assert.deepEqual((await timeline("nextcloud-sim")).stories.find((s) => s.id === "story-alex-1")?.comments, []);
+    assert.deepEqual((await timeline("google-drive-sim")).stories.find((s) => s.id === "story-alex-1")?.comments?.map((c) => c.id), ["story-sam-c1"], "Sam still sees it");
+    assert.equal((await client.request("GET", "/porch/nextcloud-sim/hidden.json")).status, 404, "hide list is private");
+
+    // Alex deletes their own comment; plain posts and unknown ids are refused.
+    assertError(await client.request("DELETE", "/api/post?id=story-alex-1"), 400, { error: "only comments and wall posts can be deleted" });
+    assertError(await client.request("DELETE", "/api/post?id=story-sam-c1"), 404, { error: "not found" });
+    assertError(await client.request("DELETE", "/api/post?id=..%2Fevil"), 404, { error: "not found" });
+    assert.equal((await client.request("DELETE", `/api/post?id=${commentId}`)).status, 200);
+    assert.deepEqual((await timeline("google-drive-sim")).stories.find((s) => s.id === "story-sam-1")?.comments, []);
+    assert.ok(!JSON.stringify(await timeline("google-drive-sim")).includes(tmp));
+  } finally {
+    if (savedIds === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;
+    else process.env.OWNPLACE_IDENTITY_DIR = savedIds;
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+    await rm(ids, { recursive: true, force: true });
+  }
+});
+
+test("reply writes need the operator login (#101)", async () => {
+  const { client, tmp } = await boot({ OWNPLACE_WRITE_TOKEN: "t" });
+  try {
+    assertError(await client.request("DELETE", "/api/post?id=story-x"), 401, { error: "unauthorized" });
+    assertError(await client.request("POST", "/api/hidden", JSON.stringify({ fingerprint: "a".repeat(64), storyId: "s" })), 401, { error: "unauthorized" });
+    assertError(await client.request("POST", "/api/post", JSON.stringify({ body: "x", to: { fingerprint: "a".repeat(64) } })), 401, { error: "unauthorized" });
+  } finally {
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
   }
 });

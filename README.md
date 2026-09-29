@@ -13,7 +13,7 @@ npm run web
 npm test
 ```
 
-Open the URL printed by Vite (normally `http://localhost:5173`). The publish command seeds two Kinfolk: Alex on `demo/stores/nextcloud-sim` and Sam on `demo/stores/google-drive-sim`, each with one signed story and following the other. `npm run verify` checks each porch on its own. Post as Sam with `npm run post -- --title T --body B --author-id kinfolk-sam`; the web composer posts as Alex. Subscribe a reader to one Kinfolk's members-only posts with `npm run subscribe -- --author-id kinfolk-sam --reader-id reader-a --reader-pubkey reader-a.pub`; the reader lands in `subscribers.json` on that Kinfolk's porch only.
+Open the URL printed by Vite (normally `http://localhost:5173`). The publish command seeds two Kinfolk: Alex on `demo/stores/nextcloud-sim` and Sam on `demo/stores/google-drive-sim`, each with one signed story and following the other. `npm run verify` checks each porch on its own. Post as Sam with `npm run post -- --title T --body B --author-id kinfolk-sam`; the web composer posts as Alex. Subscribe a reader to one Kinfolk's members-only posts with `npm run subscribe -- --author-id kinfolk-sam --reader-id reader-a --reader-pubkey reader-a.pub`; the reader lands in `subscribers.json` on that Kinfolk's porch only. Sam comments with `npm run post -- --author-id kinfolk-sam --reply-to <story id> --body B`, writes on Alex's wall with `--wall kinfolk-alex`, and deletes his own reply with `npm run delete-reply -- --author-id kinfolk-sam --id <story id>`; logged in as Alex, the page has a Comment box on every post and a Write on Sam's wall box in Sam's column.
 
 Write API auth: set `OWNPLACE_WRITE_TOKEN`; on HTTPS deploys also set `COOKIE_SECURE=1` so session cookies require TLS.
 

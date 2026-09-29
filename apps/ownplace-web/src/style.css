@@ -51,3 +51,14 @@ code { color: #53674c; }
 /* M12 #92: long invite links and fingerprints wrap instead of overflowing. */
 .composer code { overflow-wrap: anywhere; word-break: break-all; }
 .composer ol { padding-left: 1.4em; list-style: decimal; }
+
+/* M15 #101: comments sit under their post; reply boxes stay compact. */
+.comments { list-style: none; margin: 12px 0 0; padding: 0 0 0 14px; border-left: 2px solid #e6e1d7; display: flex; flex-direction: column; gap: 10px; }
+.comments p { margin: 4px 0; font-size: 16px; line-height: 1.45; }
+.comments .date { margin-top: 0; }
+.reply-box { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; }
+.reply-box textarea { width: 100%; font: 15px/1.4 system-ui, sans-serif; padding: 10px; border: 1px solid #ded9ca; border-radius: 4px; background: #fff; color: inherit; resize: vertical; }
+.reply-box button, .reply-actions button { align-self: flex-start; font: 600 14px system-ui, sans-serif; padding: 8px 12px; min-height: 40px; border: none; border-radius: 4px; background: #53674c; color: #fff; cursor: pointer; }
+.reply-box button:disabled { opacity: .5; cursor: default; }
+.reply-actions { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.reply-actions button { background: #91714b; }
