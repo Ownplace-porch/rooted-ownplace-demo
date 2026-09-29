@@ -11,7 +11,7 @@ Read this before changing anything. It applies to every agent session: local, cl
 ## Before you start
 
 1. Work from a GitHub issue. The issue body is the spec: design, acceptance criteria, out-of-scope.
-2. Branch from the base the issue names (default `main`). Name it `<milestone>/<short-slug>`, e.g. `m14/invite-panel-backend`.
+2. Branch from the base the issue names (default `main`). Local sessions name it `<milestone>/<short-slug>`, e.g. `m14/invite-panel-backend`. Cloud sessions can only push `claude/...` branches, so they use the `claude/...` branch they are given and put the milestone and issue in the PR title instead.
 3. `npm install`, then confirm the baseline is green: `npx tsc --noEmit && npm test`.
 
 ## Commands
