@@ -272,7 +272,8 @@ function YourInvite() {
   const [info, setInfo] = useState<InviteInfo | null | undefined>(undefined);
   const [copied, setCopied] = useState(false);
   useEffect(() => {
-    fetch("/api/invite?backend=nextcloud-sim")
+    // M14 #97: server picks the backend, same order as the /i/ link.
+    fetch("/api/invite")
       .then(async (res) => (res.ok ? ((await safeJson(res)) as InviteInfo | null) : null))
       .then((v) => setInfo(v && typeof v.fingerprint === "string" ? v : null), () => setInfo(null));
   }, []);
