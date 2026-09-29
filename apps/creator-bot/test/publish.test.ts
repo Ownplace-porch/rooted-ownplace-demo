@@ -94,3 +94,49 @@ test("publisher preserves timeline history across a publish cycle (#41)", async 
     await rm(tmp, { recursive: true, force: true });
   }
 });
+
+// M15 #111: a copy with its own operator seeds, follows and verifies as them.
+test("publish and verify seed the OWNPLACE_OPERATOR_* Kinfolk on the operator's porch (#111)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-publish-"));
+  const env = {
+    ...cleanEnv(tmp),
+    OWNPLACE_IDENTITY_DIR: join(tmp, "ids"),
+    OWNPLACE_OPERATOR_ID: "kinfolk-jordan",
+    OWNPLACE_OPERATOR_NAME: "Jordan",
+    OWNPLACE_OPERATOR_BIO: "Joined by QR code.",
+  };
+  try {
+    await run(process.execPath, ["--import", "tsx", publishEntry], { cwd: repoRoot, env });
+    const jordan = await readJson(tmp, "nextcloud-sim", "kinfolk.json");
+    assert.equal(jordan.id, "kinfolk-jordan");
+    assert.equal(jordan.displayName, "Jordan");
+    assert.equal(jordan.bio, "Joined by QR code.");
+    assert.equal((await readJson(tmp, "nextcloud-sim", "timeline", "story-first-light", "story.json")).authorId, "kinfolk-jordan");
+    assert.equal((await readJson(tmp, "google-drive-sim", "kinfolk.json")).displayName, "Sam", "Sam is unchanged");
+    const samFollows = (await readJson(tmp, "google-drive-sim", "contacts.json")).contacts;
+    assert.deepEqual(samFollows.map((c: { id: string; displayName: string; address: string }) => [c.id, c.displayName, c.address]),
+      [["kinfolk-jordan", "Jordan", "local:nextcloud-sim"]]);
+    assert.equal(samFollows[0].fingerprint, identityFingerprint(jordan.publicKey));
+
+    const { stdout } = await run(process.execPath, ["--import", "tsx", "apps/client-sims/src/verify-feed.ts"], { cwd: repoRoot, env });
+    assert.match(stdout, /kinfolk-jordan/);
+    assert.doesNotMatch(stdout, /kinfolk-alex/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("publish refuses to start with invalid OWNPLACE_OPERATOR_* and writes nothing (#111)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-publish-"));
+  const env = { ...cleanEnv(tmp), OWNPLACE_IDENTITY_DIR: join(tmp, "ids"), OWNPLACE_OPERATOR_NAME: "x".repeat(121) };
+  try {
+    await assert.rejects(
+      run(process.execPath, ["--import", "tsx", publishEntry], { cwd: repoRoot, env }),
+      (e: { code?: number; stderr?: string }) => e.code === 2 &&
+        (e.stderr ?? "").trim() === "refusing to start: OWNPLACE_OPERATOR_NAME must be 1 to 120 characters",
+    );
+    await assert.rejects(access(join(tmp, "nextcloud-sim")), "a refused start writes nothing");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});

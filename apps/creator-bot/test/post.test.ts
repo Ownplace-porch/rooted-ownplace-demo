@@ -273,3 +273,46 @@ test("post --author-id kinfolk-sam lands on Sam's porch; other authors are refus
     await rm(tmp, { recursive: true, force: true });
   }
 });
+
+// M15 #111: the CLIs default to, and allow, the OWNPLACE_OPERATOR_* Kinfolk.
+test("post and delete-reply use the OWNPLACE_OPERATOR_* Kinfolk; Alex is refused (#111)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
+  const jordan = { OWNPLACE_IDENTITY_DIR: join(tmp, "ids"), OWNPLACE_OPERATOR_ID: "kinfolk-jordan", OWNPLACE_OPERATOR_NAME: "Jordan" };
+  try {
+    const { stdout } = await runPost(tmp, ["--title", "From Jordan", "--body", "on the operator porch"], jordan);
+    assert.match(stdout, /done: nextcloud-sim .*author=kinfolk-jordan/);
+    const id = (stdout.match(/story=\S+/) ?? [""])[0].replace("story=", "").trim();
+    assert.equal((await readJson(tmp, "nextcloud-sim", "timeline", id, "kinfolk.json")).displayName, "Jordan");
+    await assert.rejects(
+      runPost(tmp, ["--title", "t", "--body", "b", "--author-id", "kinfolk-alex"], jordan),
+      (e: { code?: number; stderr?: string }) => e.code === 2 && /author has no porch in this demo/.test(e.stderr ?? ""),
+    );
+    // delete-reply defaults to Jordan (the plain post is found, then refused
+    // as not a reply) and refuses Alex, who has no porch on this copy.
+    const deleteReply = (args: string[]) => run(process.execPath, ["--import", "tsx", resolve(repoRoot, "apps/creator-bot/src/delete.ts"), ...args], {
+      cwd: repoRoot, env: { ...process.env, PUBLISH_ROOT: tmp, ...jordan } as NodeJS.ProcessEnv,
+    });
+    await assert.rejects(deleteReply(["--id", id]),
+      (e: { code?: number; stderr?: string }) => e.code === 2 && /only comments and wall posts can be deleted/.test(e.stderr ?? ""));
+    await assert.rejects(deleteReply(["--author-id", "kinfolk-alex", "--id", id]),
+      (e: { code?: number; stderr?: string }) => e.code === 2 && /author has no porch in this demo/.test(e.stderr ?? ""));
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("post refuses to start with an invalid OWNPLACE_OPERATOR_ID and writes nothing (#111)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
+  try {
+    for (const id of ["../alex", "kinfolk-sam", ""]) {
+      await assert.rejects(
+        runPost(tmp, ["--title", "t", "--body", "b"], { OWNPLACE_IDENTITY_DIR: join(tmp, "ids"), OWNPLACE_OPERATOR_ID: id }),
+        (e: { code?: number; stderr?: string }) => e.code === 2 &&
+          (e.stderr ?? "").trim() === "refusing to start: OWNPLACE_OPERATOR_ID must be a valid Kinfolk id other than kinfolk-sam",
+      );
+    }
+    await assert.rejects(access(join(tmp, "nextcloud-sim")), "a refused start writes nothing");
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});

@@ -42,6 +42,7 @@ import {
   isSafeHistoryId,
   OPERATOR_KINFOLK,
   isSafeReaderId,
+  requireOperatorSettings,
   publishStory,
   readVerifiedFollowedStory,
   buildInviteDocument,
@@ -56,6 +57,9 @@ import {
   validateInput,
 } from "@rooted/timeline";
 import { LocalFolderStore, PORCH_PACKAGE_FILES } from "@rooted/storage";
+
+// M15 #111: invalid OWNPLACE_OPERATOR_* settings refuse startup.
+requireOperatorSettings();
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = defaultRepoRoot();

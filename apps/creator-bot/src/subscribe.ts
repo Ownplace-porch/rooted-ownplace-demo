@@ -8,6 +8,8 @@ import {
   defaultRepoRoot,
   demoKinfolkFor,
   NO_PORCH,
+  OPERATOR_KINFOLK,
+  requireOperatorSettings,
   validateSubscriber,
 } from "@rooted/timeline";
 
@@ -19,13 +21,16 @@ function arg(name: string): string | undefined {
   return value;
 }
 
-const USAGE = "usage: npm run subscribe -- --author-id kinfolk-alex|kinfolk-sam --reader-id ID --reader-pubkey FILE";
+const USAGE = `usage: npm run subscribe -- --author-id ${OPERATOR_KINFOLK}|kinfolk-sam --reader-id ID --reader-pubkey FILE`;
 
 function fail(message: string): never {
   console.error(`subscribe failed: ${message}`);
   console.error(USAGE);
   process.exit(2);
 }
+
+// M15 #111: invalid OWNPLACE_OPERATOR_* settings refuse startup.
+requireOperatorSettings();
 
 // M16 #108: a reader subscribes to one Kinfolk, so the roster is written to
 // that Kinfolk's porch only. Unknown authors are refused before any write.

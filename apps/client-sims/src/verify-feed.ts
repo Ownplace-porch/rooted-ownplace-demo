@@ -7,6 +7,7 @@ import {
   readAuthenticatedTimeline,
   readContactFollowedTimeline,
   readContacts,
+  requireOperatorSettings,
   type DemoKinfolk,
 } from "@rooted/timeline";
 import { KinfolkClient } from "./client.js";
@@ -104,6 +105,8 @@ function isDirectRun(): boolean {
 }
 
 if (isDirectRun()) {
+  // M15 #111: invalid OWNPLACE_OPERATOR_* settings refuse startup.
+  requireOperatorSettings();
   const storesRoot = process.env.PUBLISH_ROOT ? resolve(process.env.PUBLISH_ROOT) : undefined;
   const report = await verifyStores(storesRoot);
   for (const p of report.porches) {

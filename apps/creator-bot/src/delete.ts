@@ -2,7 +2,7 @@
 // porch (and that porch's cloud). Readers stop showing it on their next read.
 // Plain posts are not deletable in this slice.
 
-import { backendsFromEnv, defaultRepoRoot, deleteReply, demoKinfolkFor, NO_PORCH } from "@rooted/timeline";
+import { backendsFromEnv, defaultRepoRoot, deleteReply, demoKinfolkFor, NO_PORCH, OPERATOR_KINFOLK, requireOperatorSettings } from "@rooted/timeline";
 
 function arg(name: string): string | undefined {
   const idx = process.argv.indexOf(`--${name}`);
@@ -12,7 +12,7 @@ function arg(name: string): string | undefined {
   return value;
 }
 
-const USAGE = "usage: npm run delete-reply -- --id STORY_ID [--author-id kinfolk-alex|kinfolk-sam]";
+const USAGE = `usage: npm run delete-reply -- --id STORY_ID [--author-id ${OPERATOR_KINFOLK}|kinfolk-sam]`;
 
 function fail(message: string): never {
   console.error(`delete failed: ${message}`);
@@ -20,7 +20,10 @@ function fail(message: string): never {
   process.exit(2);
 }
 
-const authorId = arg("author-id") ?? "kinfolk-alex";
+// M15 #111: invalid OWNPLACE_OPERATOR_* settings refuse startup.
+requireOperatorSettings();
+
+const authorId = arg("author-id") ?? OPERATOR_KINFOLK;
 const id = arg("id");
 if (!id) fail("--id is required");
 if (!demoKinfolkFor(authorId)) fail(NO_PORCH);
