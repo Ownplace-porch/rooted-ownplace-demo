@@ -6,6 +6,8 @@ import {
   addSubscriber,
   backendsFromEnv,
   defaultRepoRoot,
+  demoKinfolkFor,
+  NO_PORCH,
   validateSubscriber,
 } from "@rooted/timeline";
 
@@ -17,13 +19,20 @@ function arg(name: string): string | undefined {
   return value;
 }
 
-const USAGE = "usage: npm run subscribe -- --reader-id ID --reader-pubkey FILE";
+const USAGE = "usage: npm run subscribe -- --author-id kinfolk-alex|kinfolk-sam --reader-id ID --reader-pubkey FILE";
 
 function fail(message: string): never {
   console.error(`subscribe failed: ${message}`);
   console.error(USAGE);
   process.exit(2);
 }
+
+// M16 #108: a reader subscribes to one Kinfolk, so the roster is written to
+// that Kinfolk's porch only. Unknown authors are refused before any write.
+const authorId = arg("author-id");
+if (!authorId) fail("need --author-id");
+const kinfolk = demoKinfolkFor(authorId);
+if (!kinfolk) fail(NO_PORCH);
 
 const readerId = arg("reader-id");
 const pubkeyFile = arg("reader-pubkey");
@@ -44,11 +53,7 @@ try {
 }
 
 const backends = backendsFromEnv(defaultRepoRoot());
-const written: string[] = [];
-for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
-  const dir = resolve(backends.root, backend);
-  await mkdir(dir, { recursive: true });
-  await addSubscriber(new LocalFolderStore(dir), subscriber);
-  written.push(backend);
-}
-console.log(`done: subscribed ${subscriber.readerId} on ${written.join(", ")}`);
+const dir = resolve(backends.root, kinfolk.porch);
+await mkdir(dir, { recursive: true });
+await addSubscriber(new LocalFolderStore(dir), subscriber);
+console.log(`done: subscribed ${subscriber.readerId} to ${kinfolk.id} on ${kinfolk.porch}`);
