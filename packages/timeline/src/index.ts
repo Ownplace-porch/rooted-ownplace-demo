@@ -56,6 +56,8 @@ export interface Contact {
   address?: string;
   // M12 #92: signer key fingerprint confirmed at follow-by-invite time.
   fingerprint?: string;
+  // M13 #94: the invite this contact was followed by; re-resolved on a move.
+  invite?: string;
 }
 export interface ContactList {
   protocol: "rooted/v0.1";
@@ -211,6 +213,17 @@ function collectHistoryProblems(parsed: Record<string, unknown>): string[] {
   return problems;
 }
 
+// M13 #94: a pinned contact's porch served a package signed by another key.
+export const SIGNER_MISMATCH = "signer does not match followed creator";
+
+function signerMatches(pkg: VerifiedHistoryPackage, pin: string): boolean {
+  try {
+    return identityFingerprint(pkg.kinfolk.publicKey ?? "") === pin;
+  } catch {
+    return false;
+  }
+}
+
 export function toPublicSkipReason(rawReason: string): string {
   // Public timeline shape must not leak raw file/storage errors (OS messages,
   // errno, local absolute paths). Map each "; "-separated problem to a stable,
@@ -227,6 +240,7 @@ export function toPublicSkipReason(rawReason: string): string {
       if (KNOWN_PACKAGE_FILES.includes(name)) return `${kind}: ${name}`;
       return kind;
     }
+    if (part.includes(SIGNER_MISMATCH)) return SIGNER_MISMATCH;
     if (part.includes("package id mismatch")) return "package id mismatch";
     if (part.includes("hash mismatch")) {
       const m = part.match(/hash mismatch:\s*([A-Za-z0-9._-]+)/);
@@ -384,7 +398,7 @@ export async function rebuildIndex(store: ObjectStore, label: string): Promise<T
 // is never used for display. Entries derive solely from verified history
 // packages; tampered, unsigned, or legacy-placeholder entries are skipped.
 export async function readAuthenticatedTimeline(
-  store: ObjectStore, label: string, now: string
+  store: ObjectStore, label: string, now: string, pin?: string,
 ): Promise<{ index: TimelineIndex; skipped: { id: string; reason: string }[] }> {
   const entries: TimelineEntry[] = [];
   const skipped: { id: string; reason: string }[] = [];
@@ -400,6 +414,10 @@ export async function readAuthenticatedTimeline(
   for (const id of ids) {
     try {
       const pkg = await fetchVerifiedHistoryPackage(store, id);
+      if (pin !== undefined && !signerMatches(pkg, pin)) {
+        skipped.push({ id, reason: `${id}: ${SIGNER_MISMATCH}` });
+        continue;
+      }
       const story = pkg.story as Partial<Story>;
       if (typeof story?.id === "string" && typeof story?.title === "string" &&
           typeof story?.authorId === "string" && typeof story?.createdAt === "string" &&
@@ -431,6 +449,8 @@ export async function readAuthenticatedTimeline(
 export interface FollowedPorch {
   label: string;
   store: ObjectStore;
+  // M13 #94: only packages signed by this key fingerprint are accepted.
+  pin?: string;
 }
 
 // Follow-model broadcast (M10 demo): pull one timeline across your porch
@@ -470,7 +490,7 @@ export async function readFollowedTimelines(
       // missing local folder). A remote porch that is down must show as
       // unreadable instead, so list first. Local listing never throws.
       await porch.store.listObjects("timeline/");
-      read = await readAuthenticatedTimeline(porch.store, porch.label, now);
+      read = await readAuthenticatedTimeline(porch.store, porch.label, now, porch.pin);
     } catch {
       // One broken porch (store fault, unexpected throw) loses its own
       // entries but never the whole merged read.
@@ -560,6 +580,8 @@ interface ResolvedPorch {
   label: string;
   store: ObjectStore;
   path: string;
+  pin?: string;
+  invite?: string;
 }
 
 export interface FollowOptions {
@@ -572,7 +594,7 @@ async function resolveContactPorches(
   ownLabel: string,
   contactsLabel: string,
   opts: FollowOptions = {},
-): Promise<{ porches: ResolvedPorch[]; skipped: { porch: string; id: string; reason: string }[] }> {
+): Promise<{ porches: ResolvedPorch[]; skipped: { porch: string; id: string; reason: string }[]; contactsStore: ObjectStore | null }> {
   if (!isPorchLabel(ownLabel) || !isPorchLabel(contactsLabel)) throw new Error("bad porch label");
   const ownLoc = await locatePorch(storesRoot, ownLabel);
   const contactsLoc = await locatePorch(storesRoot, contactsLabel);
@@ -609,7 +631,10 @@ async function resolveContactPorches(
       const key = `remote:${address.replace(/\/+$/, "")}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      porches.push({ label: contact.id, store, path: key });
+      const pinned: ResolvedPorch = { label: contact.id, store, path: key };
+      if (isFingerprint(contact.fingerprint)) pinned.pin = contact.fingerprint;
+      if (contact.invite) pinned.invite = contact.invite;
+      porches.push(pinned);
       continue;
     }
     if (!address.startsWith("local:") || !isPorchAddress(address)) {
@@ -628,9 +653,52 @@ async function resolveContactPorches(
       continue;
     }
     seen.add(porchLoc.path);
-    porches.push({ label: contact.id, store: new LocalFolderStore(porchLoc.path), path: porchLoc.path });
+    const local: ResolvedPorch = { label: contact.id, store: new LocalFolderStore(porchLoc.path), path: porchLoc.path };
+    if (isFingerprint(contact.fingerprint)) local.pin = contact.fingerprint;
+    porches.push(local);
   }
-  return { porches, skipped };
+  return { porches, skipped, contactsStore };
+}
+
+// M13 #94: a pinned porch that is unreadable, or that serves nothing signed
+// by the pinned key, may have moved. Re-resolve its invite (same M12 rules:
+// same-origin porch with a verified post by the pinned key). A new address
+// replaces the store for this read and is saved best-effort. The contact id,
+// fingerprint and invite are unchanged, so there is no second follow.
+async function followMovedPorches(
+  porches: ResolvedPorch[],
+  merged: { stories: TimelineEntry[]; skipped: { porch: string; id: string; reason: string }[] },
+  contactsStore: ObjectStore | null,
+  opts: FollowOptions,
+): Promise<boolean> {
+  let moved = false;
+  for (const porch of porches) {
+    if (!porch.pin || !porch.invite) continue;
+    const unreadable = merged.skipped.some((s) => s.porch === porch.label && s.reason === "porch unreadable");
+    const mismatched = !merged.stories.some((s) => s.origin === porch.label) &&
+      merged.skipped.some((s) => s.porch === porch.label && s.reason === SIGNER_MISMATCH);
+    if (!unreadable && !mismatched) continue;
+    let fresh: Contact;
+    try {
+      fresh = await resolveInvite(porch.invite, opts);
+    } catch {
+      continue;
+    }
+    if (fresh.fingerprint !== porch.pin || !fresh.address) continue;
+    const key = `remote:${fresh.address}`;
+    if (key === porch.path) continue;
+    porch.store = new HttpsPorchStore(fresh.address, { fetch: opts.fetch });
+    porch.path = key;
+    moved = true;
+    if (contactsStore) {
+      try {
+        await updateContactAddress(contactsStore, porch.label, porch.pin, fresh.address);
+      } catch {
+        // Best effort: the next read re-resolves again.
+      }
+    }
+  }
+  return moved;
 }
 
 export async function readContactFollowedTimeline(
@@ -640,11 +708,12 @@ export async function readContactFollowedTimeline(
   contactsLabel: string = ownLabel,
   opts: FollowOptions = {},
 ): Promise<{ stories: TimelineEntry[]; skipped: { porch: string; id: string; reason: string }[] }> {
-  const { porches, skipped } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel, opts);
-  const merged = await readFollowedTimelines(
-    porches.map((porch) => ({ label: porch.label, store: porch.store })),
-    now,
-  );
+  const { porches, skipped, contactsStore } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel, opts);
+  const toFollowed = () => porches.map((porch) => ({ label: porch.label, store: porch.store, pin: porch.pin }));
+  let merged = await readFollowedTimelines(toFollowed(), now);
+  if (await followMovedPorches(porches, merged, contactsStore, opts)) {
+    merged = await readFollowedTimelines(toFollowed(), now);
+  }
   return { stories: merged.stories, skipped: [...skipped, ...merged.skipped] };
 }
 
@@ -670,7 +739,10 @@ export async function readVerifiedFollowedStory(
     const prefix = `timeline/${id}`;
     const owns = listed.some((p) => p === prefix || p.startsWith(prefix + "/"));
     if (!owns) continue;
-    return readVerifiedHistoryStory(porch.store, id);
+    const pkg = await fetchVerifiedHistoryPackage(porch.store, id);
+    // The owning porch keeps the id even on a signer mismatch: no fall-through.
+    if (porch.pin && !signerMatches(pkg, porch.pin)) throw new Error("not found");
+    return pkg.story;
   }
   throw new Error("not found");
 }
@@ -902,6 +974,7 @@ export async function readContacts(store: ObjectStore): Promise<ContactList> {
         };
         if (isPorchAddress(c.address)) contact.address = c.address.trim();
         if (isFingerprint(c.fingerprint)) contact.fingerprint = c.fingerprint;
+        if (isInviteLink(c.invite)) contact.invite = c.invite;
         return [contact];
       });
       return {
@@ -923,6 +996,8 @@ export async function addContact(store: ObjectStore, contact: Contact): Promise<
   if (existing) {
     existing.displayName = contact.displayName;
     if (contact.address) existing.address = contact.address;
+    if (contact.fingerprint) existing.fingerprint = contact.fingerprint;
+    if (contact.invite) existing.invite = contact.invite;
   } else {
     list.contacts.push(contact);
   }
@@ -930,6 +1005,18 @@ export async function addContact(store: ObjectStore, contact: Contact): Promise<
   list.updatedAt = new Date().toISOString();
   await store.writeObject("contacts.json", new TextEncoder().encode(`${JSON.stringify(list)}\n`));
   return list;
+}
+
+// M13 #94: only moves a contact that still carries the same pinned key.
+export async function updateContactAddress(store: ObjectStore, id: string, pin: string, address: string): Promise<boolean> {
+  if (!isPorchAddress(address)) throw new Error("bad porch address");
+  const list = await readContacts(store);
+  const contact = list.contacts.find((c) => c.id === id && c.fingerprint === pin);
+  if (!contact || contact.address === address) return false;
+  contact.address = address;
+  list.updatedAt = new Date().toISOString();
+  await store.writeObject("contacts.json", new TextEncoder().encode(`${JSON.stringify(list)}\n`));
+  return true;
 }
 
 export async function removeContact(store: ObjectStore, id: string): Promise<ContactList> {
@@ -1051,6 +1138,18 @@ export interface InviteDocument {
 
 export const INVITE_PATH = /^\/i\/([0-9a-f]{64})$/;
 
+export function isInviteLink(value: unknown): value is string {
+  if (typeof value !== "string" || value.length > 400) return false;
+  try {
+    const url = new URL(value);
+    const at = url.pathname.lastIndexOf("/i/");
+    return url.protocol === "https:" && !url.search && !url.hash && !url.username && at >= 0 &&
+      INVITE_PATH.test(url.pathname.slice(at));
+  } catch {
+    return false;
+  }
+}
+
 export async function porchIdentity(store: ObjectStore): Promise<{ fingerprint: string; displayName: string; bio?: string } | null> {
   try {
     const kinfolk = JSON.parse(new TextDecoder().decode(await store.readObject("kinfolk.json"))) as Partial<Kinfolk>;
@@ -1153,6 +1252,7 @@ export async function resolveInvite(inviteUrl: string, opts: FollowOptions = {})
       addedAt: new Date().toISOString(),
       address,
       fingerprint,
+      invite: `${baseUrl}/i/${fingerprint}`,
     };
   }
   throw new Error("invite porch has no verified post by this creator");
