@@ -38,7 +38,7 @@ import {
   validateContact,
   validateInput,
 } from "@rooted/timeline";
-import { LocalFolderStore } from "@rooted/storage";
+import { LocalFolderStore, PORCH_PACKAGE_FILES } from "@rooted/storage";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = defaultRepoRoot();
@@ -395,6 +395,34 @@ const server = http.createServer(async (req, res) => {
       } catch (e) {
         send(res, 400, { error: (e as Error).message });
         return;
+      }
+      return;
+    }
+
+    // --- Public porch (M11 #90) ---
+    // Read-only package files so other OwnPlace instances can follow this
+    // porch over https. Allowlist only: timeline.json (an untrusted id hint
+    // for followers) and signed package files. contacts.json and anything
+    // else stay private. Sealed bodies stay sealed.
+    if (req.method === "GET" && pathname.startsWith("/porch/")) {
+      const m = /^\/porch\/([^/]+)\/(timeline\.json|timeline\/([^/]+)\/([^/]+))$/.exec(pathname);
+      const backend = m?.[1] ?? "";
+      const id = m?.[3];
+      const file = m?.[4];
+      const allowed =
+        m !== null &&
+        (backend === "nextcloud-sim" || backend === "google-drive-sim") &&
+        (id === undefined || (isSafeHistoryId(id) && (PORCH_PACKAGE_FILES as readonly string[]).includes(file ?? "")));
+      if (!allowed) {
+        send(res, 404, { error: "not found" });
+        return;
+      }
+      try {
+        const data = await simStore(backend).readObject(m![2]);
+        res.writeHead(200, { "content-type": "application/json", "cache-control": "public, max-age=30" });
+        res.end(data);
+      } catch {
+        send(res, 404, { error: "not found" });
       }
       return;
     }

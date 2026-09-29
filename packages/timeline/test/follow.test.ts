@@ -24,6 +24,9 @@ function x25519Pair() {
   };
 }
 
+// Remote porches never touch the network in tests.
+const offline = { fetch: async () => { throw new Error("offline"); } };
+
 // M10 demo: kinfolk-alex posts on his porch; kinfolk-bob follows alex's
 // porch from hers; a fake creator drops a video post for both kinfolk.
 test("follow broadcast: porch post plus creator video reach both kinfolk", async () => {
@@ -197,18 +200,18 @@ test("contact follow: own plus two local porches merge; tamper and escape stay i
     }));
 
     const now = "2026-09-24T00:03:00.000Z";
-    const merged = await readContactFollowedTimeline(dir, "nextcloud-sim", now);
+    const merged = await readContactFollowedTimeline(dir, "nextcloud-sim", now, "nextcloud-sim", offline);
     assert.deepEqual(merged.stories.map((s) => s.id), ["story-alex-1", "story-sam-1", "story-own-1"]);
     assert.equal(merged.stories.find((s) => s.id === "story-own-1")?.origin, "nextcloud-sim");
     assert.equal(merged.stories.find((s) => s.id === "story-alex-1")?.origin, "porch-alex");
     assert.equal(merged.stories.find((s) => s.id === "story-sam-1")?.origin, "porch-sam");
-    assert.ok(merged.skipped.some((s) => s.porch === "remote-jo" && s.reason === "remote porch not fetched"));
-    const opened = await readVerifiedFollowedStory(dir, "nextcloud-sim", "story-alex-1");
+    assert.ok(merged.skipped.some((s) => s.porch === "remote-jo" && s.reason === "porch unreadable"));
+    const opened = await readVerifiedFollowedStory(dir, "nextcloud-sim", "story-alex-1", "nextcloud-sim", offline);
     assert.equal(opened.body, "from alex");
 
     // Tampered followed package loses only itself.
     await writeFile(join(dir, "porch-sam/nextcloud-sim/timeline/story-sam-1/story.json"), "{not json");
-    const again = await readContactFollowedTimeline(dir, "nextcloud-sim", now);
+    const again = await readContactFollowedTimeline(dir, "nextcloud-sim", now, "nextcloud-sim", offline);
     assert.deepEqual(again.stories.map((s) => s.id), ["story-alex-1", "story-own-1"]);
     assert.ok(again.skipped.some((s) => s.porch === "porch-sam" && s.id === "story-sam-1"));
     assert.ok(!JSON.stringify(again).includes(dir), "skip reason leaked a path");
@@ -228,7 +231,7 @@ test("contact follow: own plus two local porches merge; tamper and escape stay i
     await addContact(own, validateContact({
       id: "escape-porch", displayName: "Escape", address: "local:escape",
     }));
-    const escaped = await readContactFollowedTimeline(dir, "nextcloud-sim", now);
+    const escaped = await readContactFollowedTimeline(dir, "nextcloud-sim", now, "nextcloud-sim", offline);
     assert.ok(!escaped.stories.some((s) => s.id === "story-outside-1"));
     assert.ok(escaped.skipped.some((s) => s.porch === "escape-porch" && s.reason === "bad porch address"));
     assert.ok(escaped.skipped.some((s) => s.porch === "via-parent" && s.reason === "bad porch address"));
@@ -236,7 +239,7 @@ test("contact follow: own plus two local porches merge; tamper and escape stay i
     await rm(outside, { recursive: true, force: true });
 
     // Address book can live on a different backend label than the own read.
-    const fromDrive = await readContactFollowedTimeline(dir, "google-drive-sim", now, "nextcloud-sim");
+    const fromDrive = await readContactFollowedTimeline(dir, "google-drive-sim", now, "nextcloud-sim", offline);
     assert.ok(fromDrive.stories.some((s) => s.id === "story-own-1" && s.origin === "google-drive-sim"));
     assert.ok(fromDrive.stories.some((s) => s.id === "story-alex-1" && s.origin === "porch-alex"));
   } finally {

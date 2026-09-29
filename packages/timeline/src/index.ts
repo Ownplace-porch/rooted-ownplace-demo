@@ -20,7 +20,7 @@ import {
 import { isMediaList, isSafeReaderId, isSealedBody, loadOrCreateEncryptionIdentity, sealBodyForReaders, sealGatedContent, tryOpenBody } from "@rooted/protocol";
 // Re-exported for the web reader gate (M8 #66): same reader-id rule server-side.
 export { isSafeReaderId } from "@rooted/protocol";
-import { LocalFolderStore, WebDavStore, type ObjectStore } from "@rooted/storage";
+import { HttpsPorchStore, LocalFolderStore, WebDavStore, type ObjectStore } from "@rooted/storage";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -464,6 +464,10 @@ export async function readFollowedTimelines(
     if (!isPorchLabel(porch.label)) throw new Error("bad porch label");
     let read;
     try {
+      // readAuthenticatedTimeline treats an unlistable store as empty (a
+      // missing local folder). A remote porch that is down must show as
+      // unreadable instead, so list first. Local listing never throws.
+      await porch.store.listObjects("timeline/");
       read = await readAuthenticatedTimeline(porch.store, porch.label, now);
     } catch {
       // One broken porch (store fault, unexpected throw) loses its own
@@ -490,12 +494,13 @@ export async function readFollowedTimelines(
 // M10 #76: pull followed porches named by the contact address book.
 // local: addresses resolve under storesRoot and must stay inside it
 // (lexical containment, then realpath; a symlink that escapes is skipped).
-// https: contacts are not fetched — remote pull is a later slice.
+// M11 #90: https: contacts are fetched read-only through HttpsPorchStore
+// and verified the same way; an unreachable one is "porch unreadable".
 // Origin is the own backend label, or the contact id when that id is a
 // porch label. Trust order is own porch first, then contacts list order.
 // A porch that already has an id owns it even if unverified, so a later
 // squat cannot fall through on story open.
-const FOLLOW_SKIP_REMOTE = "remote porch not fetched";
+const FOLLOW_SKIP_REMOTE = "remote porch refused";
 const FOLLOW_SKIP_ADDRESS = "bad porch address";
 const FOLLOW_SKIP_LABEL = "bad porch label";
 
@@ -551,14 +556,20 @@ async function locatePorch(storesRoot: string, rel: string): Promise<PorchLocate
 
 interface ResolvedPorch {
   label: string;
-  store: LocalFolderStore;
+  store: ObjectStore;
   path: string;
+}
+
+export interface FollowOptions {
+  // Test seam for remote porches; production uses the global fetch.
+  fetch?: (input: string, init?: RequestInit) => Promise<Response>;
 }
 
 async function resolveContactPorches(
   storesRoot: string,
   ownLabel: string,
   contactsLabel: string,
+  opts: FollowOptions = {},
 ): Promise<{ porches: ResolvedPorch[]; skipped: { porch: string; id: string; reason: string }[] }> {
   if (!isPorchLabel(ownLabel) || !isPorchLabel(contactsLabel)) throw new Error("bad porch label");
   const ownLoc = await locatePorch(storesRoot, ownLabel);
@@ -582,7 +593,21 @@ async function resolveContactPorches(
     if (!address) continue;
     const porch = safePorchName(contact.id);
     if (address.startsWith("https://")) {
-      skipped.push({ porch, id: "*", reason: FOLLOW_SKIP_REMOTE });
+      if (!isPorchAddress(address) || !isPorchLabel(contact.id)) {
+        skipped.push({ porch, id: "*", reason: isPorchAddress(address) ? FOLLOW_SKIP_LABEL : FOLLOW_SKIP_ADDRESS });
+        continue;
+      }
+      let store: HttpsPorchStore;
+      try {
+        store = new HttpsPorchStore(address, { fetch: opts.fetch });
+      } catch {
+        skipped.push({ porch, id: "*", reason: FOLLOW_SKIP_REMOTE });
+        continue;
+      }
+      const key = `remote:${address.replace(/\/+$/, "")}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      porches.push({ label: contact.id, store, path: key });
       continue;
     }
     if (!address.startsWith("local:") || !isPorchAddress(address)) {
@@ -611,8 +636,9 @@ export async function readContactFollowedTimeline(
   ownLabel: string,
   now: string,
   contactsLabel: string = ownLabel,
+  opts: FollowOptions = {},
 ): Promise<{ stories: TimelineEntry[]; skipped: { porch: string; id: string; reason: string }[] }> {
-  const { porches, skipped } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel);
+  const { porches, skipped } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel, opts);
   const merged = await readFollowedTimelines(
     porches.map((porch) => ({ label: porch.label, store: porch.store })),
     now,
@@ -625,13 +651,20 @@ export async function readVerifiedFollowedStory(
   ownLabel: string,
   id: string,
   contactsLabel: string = ownLabel,
+  opts: FollowOptions = {},
 ): Promise<Story> {
   if (!isSafeHistoryId(id)) throw new Error("not found");
-  const { porches } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel);
+  const { porches } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel, opts);
   for (const porch of porches) {
     // Any file under the id owns it, even with no manifest, so a squat
     // cannot fall through when the first porch is only partly present.
-    const listed = await porch.store.listObjects("timeline/");
+    // An unreachable remote porch is skipped, as in the timeline merge.
+    let listed: string[];
+    try {
+      listed = await porch.store.listObjects("timeline/");
+    } catch {
+      continue;
+    }
     const prefix = `timeline/${id}`;
     const owns = listed.some((p) => p === prefix || p.startsWith(prefix + "/"));
     if (!owns) continue;

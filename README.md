@@ -22,6 +22,7 @@ Tailscale serve (`tailscale serve --bg --https=<port> http://127.0.0.1:8091`)
 or an nginx `location /ownplace/` proxy with `proxy_set_header X-Forwarded-Proto $scheme`.
 Reads stay public; writes still require the operator token/session.
 `GET /api/health` returns `{ok:true}` for uptime checks.
+Followers on other instances read this porch at `https://<public-url>/porch/nextcloud-sim` (add that as an `https:` contact address); only signed package files and `timeline.json` are served there.
 Behind TLS the session cookie is marked Secure automatically
 (or force with `COOKIE_SECURE=1`).
 
