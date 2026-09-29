@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalFolderStore } from "@rooted/storage";
@@ -21,6 +21,12 @@ import {
 // follower resolves Rowan's invite once, then reads with no network: every
 // URL maps to a folder. `state.porch` is where the invite currently points,
 // and `state.served` lists the porch paths that still answer.
+// M15 #100: posts are no longer mirrored, so Rowan's second porch is an
+// explicit copy of the first (what a move to another backend leaves behind).
+async function copyToSecondPorch(dir: string) {
+  await cp(join(dir, "creator/nextcloud-sim"), join(dir, "creator/google-drive-sim"), { recursive: true });
+}
+
 async function setup() {
   const dir = await mkdtemp(join(tmpdir(), "rooted-pinned-"));
   const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
@@ -30,6 +36,7 @@ async function setup() {
     { root: join(dir, "creator") },
     { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-rowan-1" },
   );
+  await copyToSecondPorch(dir);
   const identity = (await porchIdentity(new LocalFolderStore(join(dir, "creator/nextcloud-sim"))))!;
   const state = {
     porch: "nextcloud-sim",
@@ -88,6 +95,7 @@ test("pin: a post signed by another key on the followed porch is hidden", async 
       { root: join(t.dir, "creator") },
       { createdAt: "2026-09-29T00:30:00.000Z", storyId: "story-squat-1" },
     );
+    await copyToSecondPorch(t.dir);
     const merged = await t.read();
     assert.deepEqual(merged.stories.map((s) => s.id), ["story-rowan-1"]);
     assert.ok(merged.skipped.some((s) => s.porch === t.contact.id && s.id === "story-squat-1" && s.reason === SIGNER_MISMATCH));

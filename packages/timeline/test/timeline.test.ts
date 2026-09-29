@@ -43,7 +43,7 @@ test("buildPackage produces verifiable manifest", async () => {
   assert.deepEqual(Object.keys(pkg.files).sort(), ["kinfolk.json", "manifest.json", "signature.json", "story.json"]);
 });
 
-test("publishStory syndicates identical timeline copies to both sims", async () => {
+test("publishStory writes the author's porch only (#100)", async () => {
   const { mkdtemp: mk } = await import("node:fs/promises");
   const tmp = await mk(join(tmpdir(), "rooted-lib-"));
   try {
@@ -52,8 +52,10 @@ test("publishStory syndicates identical timeline copies to both sims", async () 
       createdAt: "2026-09-20T00:00:00.000Z",
       storyId: "story-2026-09-20-libtest1",
     });
-    assert.deepEqual(res.backends, ["nextcloud-sim", "google-drive-sim"]);
+    assert.deepEqual(res.backends, ["nextcloud-sim"]);
     assert.deepEqual(res.skipped.sort(), ["google-drive", "kevcloud"]);
+    const { access } = await import("node:fs/promises");
+    await assert.rejects(access(join(tmp, "google-drive-sim")), "Alex's post must not mirror to Sam's porch");
     const { readFile } = await import("node:fs/promises");
     for (const f of ["story.json", "manifest.json", "timeline.json"]) {
       const a = await readFile(join(tmp, "nextcloud-sim", ...(f === "timeline.json" ? [f] : ["timeline", res.storyId, f])));

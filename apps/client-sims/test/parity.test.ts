@@ -29,7 +29,8 @@ test("verifyParity passes on fresh sims without cloud env", async () => {
     assert.equal(report.ok, true);
     assert.ok(report.backends.includes("nextcloud-sim"));
     assert.ok(report.backends.includes("google-drive-sim"));
-    assert.equal(report.fingerprints["nextcloud-sim"], report.fingerprints["google-drive-sim"]);
+    // M15 #100: two Kinfolk, so the sims are never expected to match.
+    assert.notEqual(report.fingerprints["nextcloud-sim"], report.fingerprints["google-drive-sim"]);
     assert.deepStrictEqual(report.problems, []);
   } finally {
     process.env = saved;

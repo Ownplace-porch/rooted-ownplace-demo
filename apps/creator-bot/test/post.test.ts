@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,17 +29,16 @@ async function readJson(tmp: string, backend: string, ...parts: string[]) {
   return JSON.parse(await readFile(join(tmp, backend, ...parts), "utf8"));
 }
 
-test("post publishes identical timeline story to both sims", async () => {
+test("post publishes the timeline story to Alex's porch only (#100)", async () => {
   const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
   try {
     const { stdout } = await runPost(tmp, ["--title", "Hello timeline", "--body", "First syndicated post"]);
     const id = (stdout.match(/story=\S+/) ?? [""])[0].replace("story=", "").trim();
     assert.ok(id.startsWith("story-"), `expected story id in output, got: ${stdout.slice(-200)}`);
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    await assert.rejects(access(join(tmp, "google-drive-sim")), "Alex's post must not mirror to Sam's porch");
+    for (const backend of ["nextcloud-sim"]) {
       for (const f of ["kinfolk.json", "story.json", "manifest.json", "signature.json"]) {
-        const a = await readFile(join(tmp, "nextcloud-sim", "timeline", id, f));
-        const b = await readFile(join(tmp, backend, "timeline", id, f));
-        assert.deepStrictEqual(a, b, `${backend}/${f} differs`);
+        assert.ok((await readFile(join(tmp, backend, "timeline", id, f))).length > 0, `${backend}/${f} missing`);
       }
       const index = await readJson(tmp, backend, "timeline.json");
       assert.ok(index.stories.some((s: { id: string }) => s.id === id), `${backend} index missing ${id}`);
@@ -108,7 +107,7 @@ test("post rebuilds corrupt timeline index from on-disk history", async () => {
   }
 });
 
-test("post --entitle-readers seals for N readers, byte-identical sims", async () => {
+test("post --entitle-readers seals for N readers on the author's porch", async () => {
   const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
   const { generateKeyPairSync } = await import("node:crypto");
   const { writeFile } = await import("node:fs/promises");
@@ -147,11 +146,10 @@ test("post --entitle-readers seals for N readers, byte-identical sims", async ()
     const id = (stdout.match(/story=\S+/) ?? [""])[0].replace("story=", "").trim();
     assert.ok(id.startsWith("story-"), `expected story id in output, got: ${stdout.slice(-200)}`);
     const packageFiles = ["kinfolk.json", "story.json", "manifest.json", "signature.json", "entitlements.json"];
-    for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+    await assert.rejects(access(join(tmp, "google-drive-sim")), "Alex's post must not mirror to Sam's porch");
+    for (const backend of ["nextcloud-sim"]) {
       for (const f of packageFiles) {
-        const mine = await readFile(join(tmp, "nextcloud-sim", "timeline", id, f));
-        const theirs = await readFile(join(tmp, backend, "timeline", id, f));
-        assert.deepStrictEqual(mine, theirs, `${backend}/${f} differs`);
+        assert.ok((await readFile(join(tmp, backend, "timeline", id, f))).length > 0, `${backend}/${f} missing`);
       }
       // Flat latest copy matches timeline copy (sidecar included).
       for (const f of ["story.json", "manifest.json", "entitlements.json"]) {
@@ -247,6 +245,30 @@ test("post --entitle-readers combines with legacy flags and rejects misuse with 
     ]));
     assert.equal(await exitCode(["--title", "T", "--body", "B", "--entitle-readers", dupes]), 2);
     assert.equal(await exitCode(["--title", "T", "--body", "B", "--entitle-readers", join(tmp, "absent.json")]), 2);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("post --author-id kinfolk-sam lands on Sam's porch; other authors are refused (#100)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
+  const idsDir = join(tmp, "ids");
+  try {
+    const { stdout } = await runPost(tmp, ["--title", "From Sam", "--body", "on the drive porch", "--author-id", "kinfolk-sam"],
+      { OWNPLACE_IDENTITY_DIR: idsDir });
+    const id = (stdout.match(/story=\S+/) ?? [""])[0].replace("story=", "").trim();
+    assert.match(stdout, /done: google-drive-sim /);
+    const story = await readJson(tmp, "google-drive-sim", "timeline", id, "story.json");
+    assert.equal(story.authorId, "kinfolk-sam");
+    const kinfolk = await readJson(tmp, "google-drive-sim", "timeline", id, "kinfolk.json");
+    assert.equal(kinfolk.displayName, "Sam");
+    await assert.rejects(access(join(tmp, "nextcloud-sim")), "Sam's post must not mirror to Alex's porch");
+
+    await assert.rejects(
+      runPost(tmp, ["--title", "t", "--body", "b", "--author-id", "kinfolk-bob"], { OWNPLACE_IDENTITY_DIR: idsDir }),
+      (e: { code?: number; stderr?: string }) => e.code === 2 && /author has no porch in this demo/.test(e.stderr ?? ""),
+    );
+    await assert.rejects(access(join(tmp, "nextcloud-sim")), "a refused post writes nothing");
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

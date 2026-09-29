@@ -12,7 +12,12 @@ type InviteInfo = { fingerprint: string; displayName: string; bio?: string; path
 type InviteDoc = { kind: "invite"; fingerprint: string; displayName: string; bio?: string };
 type ContactList = { contacts: Contact[] };
 
-const BACKENDS = ["nextcloud-sim", "google-drive-sim"];
+// M15 #100: two Kinfolk, one cloud each. The operator (logged in) is Alex.
+const PORCHES = [
+  { backend: "nextcloud-sim", kinfolk: "Alex", cloud: "Nextcloud" },
+  { backend: "google-drive-sim", kinfolk: "Sam", cloud: "Google Drive" },
+];
+const OPERATOR = PORCHES[0];
 
 function isEntry(s: unknown): s is TimelineEntry {
   if (typeof s !== "object" || s === null) return false;
@@ -133,7 +138,7 @@ function Composer({ onPosted }: { onPosted: () => void }) {
       if (!res.ok) {
         setStatus(`Post failed: ${parsed?.error ?? res.status}`);
       } else {
-        setStatus(`Posted ${parsed?.storyId ?? ""} — syndicated to all backends.`);
+        setStatus(`Posted ${parsed?.storyId ?? ""} to ${OPERATOR.kinfolk}'s porch on ${OPERATOR.cloud}.`);
         setTitle("");
         setBody("");
         onPosted();
@@ -147,7 +152,7 @@ function Composer({ onPosted }: { onPosted: () => void }) {
   return (
     <section className="composer">
       <h2>New post</h2>
-      <p className="lede">Posting goes to everyone syndicated with you.</p>
+      <p className="lede">Posting as {OPERATOR.kinfolk} · {OPERATOR.cloud}. Kinfolk who follow {OPERATOR.kinfolk} see it on their porch.</p>
       <form onSubmit={submit}>
         <input
           value={title}
@@ -240,7 +245,7 @@ function Contacts({ onChanged }: { onChanged?: () => void }) {
       <form onSubmit={add}>
         <input value={id} onChange={(e) => setId(e.target.value)} placeholder="kinfolk id" aria-label="Contact id" />
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Display name" aria-label="Display name" />
-        <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder="local:nextcloud-sim or https://porch" aria-label="Porch address" />
+        <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder="local:google-drive-sim or https://porch" aria-label="Porch address" />
         <button type="submit" disabled={!id.trim() || !name.trim() || !address.trim()}>Follow</button>
       </form>
       {status && <p className="date">{status}</p>}
@@ -485,24 +490,25 @@ function Unlocker({ backend, id }: { backend: string; id: string }) {
   );
 }
 
-function BackendColumn({ backend, refresh }: { backend: string; refresh: number }) {
+function BackendColumn({ backend, kinfolk, cloud, refresh }: { backend: string; kinfolk: string; cloud: string; refresh: number }) {
   const state = useBackend(backend, refresh);
   const [contacts, setContacts] = useState<Contact[]>([]);
   useEffect(() => {
-    fetch("/api/contacts")
+    // M15 #100: origin labels come from this porch's own contacts.
+    fetch(`/api/contacts?backend=${encodeURIComponent(backend)}`)
       .then(async (res) => {
         const parsed = (await safeJson(res)) as ContactList | null;
         setContacts(Array.isArray(parsed?.contacts) ? parsed.contacts : []);
       })
       .catch(() => setContacts([]));
-  }, [refresh]);
+  }, [backend, refresh]);
   return (
     <article>
       <div className="card-head">
         <span className="dot" />
         <div>
-          <p className="label">Simulated backend</p>
-          <h2>{backend}</h2>
+          <p className="label">Simulated {cloud} · {backend}</p>
+          <h2>{kinfolk} · {cloud}</h2>
         </div>
       </div>
       {state.status === "loading" && <p>Loading timeline…</p>}
@@ -521,7 +527,7 @@ function BackendColumn({ backend, refresh }: { backend: string; refresh: number 
         <>
           {state.entries.map((e) => {
             const s = state.stories[e.id];
-            const from = originLabel(e.origin, backend, contacts);
+            const from = originLabel(e.origin, backend, contacts, kinfolk);
             return (
               <div key={e.id} className="story">
                 <p className="date">{formatDate(e.createdAt)} · verified signature{from ? ` · ${from}` : ""}</p>
@@ -619,8 +625,8 @@ function App() {
         <p className="eyebrow">ROOTED / OWNPLACE</p>
         <h1>Your place, wherever your data lives.</h1>
         <p className="lede">
-          Kinfolk timelines, read from two independent storage backends.
-          Posting goes to everyone syndicated with you.
+          Two Kinfolk, each on their own cloud. Each column is one porch: its
+          owner's posts plus the Kinfolk they follow.
         </p>
       </header>
       <section className="boundary">
@@ -645,8 +651,8 @@ function App() {
         </>
       )}
       <div className="grid">
-        {BACKENDS.map((b) => (
-          <BackendColumn key={b} backend={b} refresh={refresh} />
+        {PORCHES.map((p) => (
+          <BackendColumn key={p.backend} backend={p.backend} kinfolk={p.kinfolk} cloud={p.cloud} refresh={refresh} />
         ))}
       </div>
     </main>

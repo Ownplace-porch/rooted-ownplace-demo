@@ -193,7 +193,7 @@ test("contact follow: own plus two local porches merge; tamper and escape stay i
       id: "porch-alex", displayName: "Alex", address: "local:porch-alex/nextcloud-sim",
     }));
     await addContact(own, validateContact({
-      id: "porch-sam", displayName: "Sam", address: "local:porch-sam/nextcloud-sim",
+      id: "porch-sam", displayName: "Sam", address: "local:porch-sam/google-drive-sim",
     }));
     await addContact(own, validateContact({
       id: "remote-jo", displayName: "Jo", address: "https://porch.example/jo",
@@ -210,7 +210,7 @@ test("contact follow: own plus two local porches merge; tamper and escape stay i
     assert.equal(opened.body, "from alex");
 
     // Tampered followed package loses only itself.
-    await writeFile(join(dir, "porch-sam/nextcloud-sim/timeline/story-sam-1/story.json"), "{not json");
+    await writeFile(join(dir, "porch-sam/google-drive-sim/timeline/story-sam-1/story.json"), "{not json");
     const again = await readContactFollowedTimeline(dir, "nextcloud-sim", now, "nextcloud-sim", offline);
     assert.deepEqual(again.stories.map((s) => s.id), ["story-alex-1", "story-own-1"]);
     assert.ok(again.skipped.some((s) => s.porch === "porch-sam" && s.id === "story-sam-1"));
@@ -239,8 +239,9 @@ test("contact follow: own plus two local porches merge; tamper and escape stay i
     await rm(outside, { recursive: true, force: true });
 
     // Address book can live on a different backend label than the own read.
+    // M15 #100: posts are not mirrored, so the drive porch has no own entries.
     const fromDrive = await readContactFollowedTimeline(dir, "google-drive-sim", now, "nextcloud-sim", offline);
-    assert.ok(fromDrive.stories.some((s) => s.id === "story-own-1" && s.origin === "google-drive-sim"));
+    assert.ok(!fromDrive.stories.some((s) => s.origin === "google-drive-sim"));
     assert.ok(fromDrive.stories.some((s) => s.id === "story-alex-1" && s.origin === "porch-alex"));
   } finally {
     if (savedIds === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;

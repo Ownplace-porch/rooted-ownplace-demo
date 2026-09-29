@@ -1,5 +1,5 @@
 // Shared timeline library: story package construction, index read/rebuild,
-// and syndication to every configured backend. Used by the CLI (`post.ts`)
+// and publishing to the author's own porch (M15 #100). Used by the CLI (`post.ts`)
 // and the web write API (`apps/ownplace-web/src/server.ts`) so both write
 // through the SAME lane. Slice-2 paid gating: optional multi-reader sealed bodies via publishStory entitle/entitleReaders opts; web API stays public-only.
 // Slice-3 paid gating: gated packages also carry a signed entitlements.json
@@ -82,6 +82,35 @@ export interface PublishResult {
   skipped: string[];
 }
 
+// M15 #100: two Kinfolk, one cloud each. Each demo Kinfolk owns one porch
+// (a local sim) and, when enabled, the one real cloud that porch maps to.
+// Nothing is mirrored between them; they meet only by following each other.
+export interface DemoKinfolk {
+  id: string;
+  displayName: string;
+  bio: string;
+  porch: "nextcloud-sim" | "google-drive-sim";
+  cloud: "kevcloud" | "google-drive";
+}
+
+export const DEMO_KINFOLK: readonly DemoKinfolk[] = [
+  { id: "kinfolk-alex", displayName: "Alex Rowan", bio: "Building a more rooted internet.", porch: "nextcloud-sim", cloud: "kevcloud" },
+  { id: "kinfolk-sam", displayName: "Sam", bio: "Keeping a porch on a different cloud.", porch: "google-drive-sim", cloud: "google-drive" },
+];
+
+// The web operator (single write token) is this Kinfolk and posts only as them.
+export const OPERATOR_KINFOLK = "kinfolk-alex";
+
+export const NO_PORCH = "author has no porch in this demo";
+
+export function demoKinfolkFor(authorId: string): DemoKinfolk | undefined {
+  return DEMO_KINFOLK.find((k) => k.id === authorId);
+}
+
+// Library callers publishing as any other Kinfolk (tests, fixtures) get one
+// porch, never a mirror. The demo CLI and web API refuse such authors.
+const DEFAULT_PORCH: Pick<DemoKinfolk, "porch" | "cloud"> = { porch: "nextcloud-sim", cloud: "kevcloud" };
+
 export const TITLE_MAX = 140;
 export const BODY_MAX = 5000;
 
@@ -96,8 +125,11 @@ export function validateInput(input: StoryInput): { title: string; body: string;
   if (cleanBody.length > BODY_MAX) throw new Error(`body too long: max ${BODY_MAX} characters`);
   if (input.authorId !== undefined && typeof input.authorId !== "string") throw new Error("author-id must be a string");
   if (input.authorName !== undefined && typeof input.authorName !== "string") throw new Error("author-name must be a string");
-  const rawAuthorId = typeof input.authorId === "string" ? input.authorId : "kinfolk-alex";
-  const rawAuthorName = typeof input.authorName === "string" ? input.authorName : "Alex Rowan";
+  const rawAuthorId = typeof input.authorId === "string" ? input.authorId : OPERATOR_KINFOLK;
+  // M15 #100: a demo Kinfolk posting without a name keeps their own name.
+  const rawAuthorName = typeof input.authorName === "string"
+    ? input.authorName
+    : (DEMO_KINFOLK.find((k) => k.id === rawAuthorId.trim())?.displayName ?? "Alex Rowan");
   const authorId = rawAuthorId.trim();
   const authorName = rawAuthorName.trim();
   if (!authorId || !authorName) throw new Error("author-id and author-name must be non-empty");
@@ -758,9 +790,11 @@ export interface EntitleReader {
   readerPublicKey: string;
 }
 
-export function buildPackage(input: { title: string; body: string; media?: string[]; authorId: string; authorName: string; createdAt: string; storyId: string }, opts: { entitle?: EntitleReader; entitleReaders?: EntitleReader[] } = {}) {
+export function buildPackage(input: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string; createdAt: string; storyId: string }, opts: { entitle?: EntitleReader; entitleReaders?: EntitleReader[] } = {}) {
   const identity = loadOrCreateIdentity(input.authorId);
   const kinfolk: Kinfolk = { id: input.authorId, displayName: input.authorName, publicKey: identity.publicKey };
+  // M15 #100: the seed publisher signs the bio the invite panel shows.
+  if (input.authorBio) kinfolk.bio = input.authorBio;
   const story: Story = {
     id: input.storyId,
     title: input.title,
@@ -838,7 +872,7 @@ async function publishToTimeline(
   // M4 flat-copy lifecycle: public packages carry no sidecar, so a later
   // PUBLIC post must clear any stale flat entitlements.json left by an
   // earlier gated post. History (timeline/<id>/) is untouched; verification
-  // only reads history. Same op on every backend (sims stay identical).
+  // only reads history.
   if (!(ENTITLEMENTS_FILE in files)) {
     await store.deleteObject(ENTITLEMENTS_FILE);
   }
@@ -873,28 +907,30 @@ export function backendsFromEnv(repoRoot: string): BackendSet {
   return out;
 }
 
-/** Syndicate one validated story to every configured backend. */
+/** Publish one validated story to its author's porch and that porch's cloud. */
 export async function publishStory(
-  validated: { title: string; body: string; media?: string[]; authorId: string; authorName: string },
+  validated: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string },
   backends: BackendSet,
   opts: { createdAt?: string; storyId?: string; entitle?: EntitleReader; entitleReaders?: EntitleReader[]; membersOnly?: boolean } = {}
 ): Promise<PublishResult> {
+  // M15 #100: one Kinfolk, one porch (and that porch's cloud only).
+  const home = demoKinfolkFor(validated.authorId) ?? DEFAULT_PORCH;
   const now = opts.createdAt ?? new Date().toISOString();
   const storyId = opts.storyId ?? makeStoryId(now);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(storyId)) throw new Error("unsafe story id");
-  const entitleReaders = await mergeSubscriberReaders(backends, opts, validated.authorId);
+  const entitleReaders = await mergeSubscriberReaders(backends, opts, validated.authorId, home.porch);
   const { files, story } = buildPackage({ ...validated, createdAt: now, storyId }, entitleReaders.length ? { entitleReaders } : {});
   const published: string[] = [];
   const skipped: string[] = [];
 
-  for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
-    const dir = resolve(backends.root, backend);
-    await mkdir(dir, { recursive: true });
-    await publishToTimeline(backend, new LocalFolderStore(dir), storyId, story, files, now);
-    published.push(backend);
-  }
+  const dir = resolve(backends.root, home.porch);
+  await mkdir(dir, { recursive: true });
+  await publishToTimeline(home.porch, new LocalFolderStore(dir), storyId, story, files, now);
+  published.push(home.porch);
 
-  if (backends.kevcloud) {
+  if (home.cloud !== "kevcloud") {
+    skipped.push("kevcloud");
+  } else if (backends.kevcloud) {
     await publishToTimeline(
       "kevcloud (WebDAV)",
       new WebDavStore({ ...backends.kevcloud }),
@@ -906,8 +942,10 @@ export async function publishStory(
     console.log("skip kevcloud: KEVCLOUD_WEBDAV_URL/USER/PASS not set");
   }
 
-  if (backends.drive) {
-    const src = resolve(backends.root, "google-drive-sim") + "/";
+  if (home.cloud !== "google-drive") {
+    skipped.push("google-drive");
+  } else if (backends.drive) {
+    const src = resolve(backends.root, home.porch) + "/";
     await run("rclone", ["copy", src, `${backends.drive.remote}${backends.drive.folder}/`, "--timeout", "30s"],
       { timeout: 90000 });
     console.log(`posted ${storyId} to google-drive (rclone ${backends.drive.remote}${backends.drive.folder}/)`);
@@ -1092,6 +1130,7 @@ async function mergeSubscriberReaders(
   backends: BackendSet,
   opts: { entitle?: EntitleReader; entitleReaders?: EntitleReader[]; membersOnly?: boolean },
   authorId: string,
+  porch: string,
 ): Promise<EntitleReader[]> {
   const readers: EntitleReader[] = [...(opts.entitleReaders ?? []), ...(opts.entitle ? [opts.entitle] : [])];
   const gated = opts.membersOnly === true || readers.length > 0;
@@ -1102,7 +1141,8 @@ async function mergeSubscriberReaders(
     seen.add(authorId);
     readers.push({ readerId: authorId, readerPublicKey: enc.publicKey });
   }
-  const store = new LocalFolderStore(resolve(backends.root, "nextcloud-sim"));
+  // M15 #100: subscribers are read from the author's own porch.
+  const store = new LocalFolderStore(resolve(backends.root, porch));
   const roster = await readSubscribers(store);
   for (const s of roster.subscribers) {
     if (seen.has(s.readerId)) continue;
