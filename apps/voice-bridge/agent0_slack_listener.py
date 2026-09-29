@@ -1182,11 +1182,22 @@ def consultant_watcher(settings: Settings) -> None:
                     LOG.info("Consultant follow: %s post %s, routing %s turn", name, ts, "ACTION" if is_order else "discussion")
                     voice = "claude" if name == "Claude" else "codex"
                     AUDIO_JOBS.put((settings, channel, ts, "", f"{name}. {substance}", voice))
-                    route_agent0_turn(
-                        settings, channel, ts,
-                        f"{name} posted (auto-follow, no human mention needed): {substance}",
-                        is_order,
-                    )
+                    instruction = f"{name} posted (auto-follow, no human mention needed): {substance}"
+                    if is_order:
+                        # Consultant bots answer anyone in the channel, so their
+                        # work orders need the same owner Area 51 confirmation as
+                        # Kevin's own. Key on the thread root so an in-thread
+                        # reply from Kevin matches (see handle_event).
+                        post_message(
+                            settings, channel,
+                            f"{name} asked Agent0 to act:\n> {substance[:300]}",
+                            thread_ts=message.get("thread_ts") or ts,
+                        )
+                        request_action_confirmation(
+                            settings, channel, message.get("thread_ts") or ts, instruction, True,
+                        )
+                    else:
+                        route_agent0_turn(settings, channel, ts, instruction, False)
         except Exception as exc:
             LOG.warning("Consultant watcher failed: %s", exc)
 
