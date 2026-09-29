@@ -17,7 +17,7 @@ import {
   type Kinfolk,
   type Story,
 } from "@rooted/protocol";
-import { isMediaList, isSafeReaderId, isSealedBody, loadOrCreateEncryptionIdentity, sealBodyForReaders, sealGatedContent, tryOpenBody } from "@rooted/protocol";
+import { identityFingerprint, isFingerprint, isMediaList, isSafeReaderId, isSealedBody, loadOrCreateEncryptionIdentity, sealBodyForReaders, sealGatedContent, tryOpenBody } from "@rooted/protocol";
 // Re-exported for the web reader gate (M8 #66): same reader-id rule server-side.
 export { isSafeReaderId } from "@rooted/protocol";
 import { HttpsPorchStore, LocalFolderStore, WebDavStore, type ObjectStore } from "@rooted/storage";
@@ -54,6 +54,8 @@ export interface Contact {
   // M10 #75: where the followed porch lives. Optional on read so contacts
   // written before this field still load. Required on new adds.
   address?: string;
+  // M12 #92: signer key fingerprint confirmed at follow-by-invite time.
+  fingerprint?: string;
 }
 export interface ContactList {
   protocol: "rooted/v0.1";
@@ -899,6 +901,7 @@ export async function readContacts(store: ObjectStore): Promise<ContactList> {
           addedAt: typeof c.addedAt === "string" ? c.addedAt : new Date().toISOString(),
         };
         if (isPorchAddress(c.address)) contact.address = c.address.trim();
+        if (isFingerprint(c.fingerprint)) contact.fingerprint = c.fingerprint;
         return [contact];
       });
       return {
@@ -1028,4 +1031,129 @@ async function mergeSubscriberReaders(
 
 export function defaultRepoRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
+}
+
+// --- Invitations (M12 #92) ---
+// An invite names a creator by key fingerprint and says where their porch
+// is, relative to the invite URL. It carries no storage paths or secrets.
+// Nothing in the document is trusted by a follower: the fingerprint must
+// match the signer of a verified package on that porch, and the display
+// name is taken from that signed package.
+
+export interface InviteDocument {
+  protocol: "rooted/v0.1";
+  kind: "invite";
+  fingerprint: string;
+  displayName: string;
+  bio?: string;
+  porch: string;
+}
+
+export const INVITE_PATH = /^\/i\/([0-9a-f]{64})$/;
+
+export async function porchIdentity(store: ObjectStore): Promise<{ fingerprint: string; displayName: string; bio?: string } | null> {
+  try {
+    const kinfolk = JSON.parse(new TextDecoder().decode(await store.readObject("kinfolk.json"))) as Partial<Kinfolk>;
+    if (typeof kinfolk.publicKey !== "string" || typeof kinfolk.displayName !== "string") return null;
+    const out: { fingerprint: string; displayName: string; bio?: string } = {
+      fingerprint: identityFingerprint(kinfolk.publicKey),
+      displayName: kinfolk.displayName.slice(0, 120),
+    };
+    if (typeof kinfolk.bio === "string") out.bio = kinfolk.bio.slice(0, 500);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+export function buildInviteDocument(identity: { fingerprint: string; displayName: string; bio?: string }, backend: string): InviteDocument {
+  if (!isPorchLabel(backend)) throw new Error("bad porch label");
+  const doc: InviteDocument = {
+    protocol: "rooted/v0.1",
+    kind: "invite",
+    fingerprint: identity.fingerprint,
+    displayName: identity.displayName,
+    porch: `../porch/${backend}`,
+  };
+  if (identity.bio) doc.bio = identity.bio;
+  return doc;
+}
+
+export function inviteContactId(fingerprint: string): string {
+  return `op-${fingerprint.slice(0, 12)}`;
+}
+
+// Resolve and verify an invite link, returning the contact to store.
+// Fails closed on any mismatch; messages are public-safe (no raw errors).
+export async function resolveInvite(inviteUrl: string, opts: FollowOptions = {}): Promise<Contact> {
+  let url: URL;
+  try {
+    url = new URL(inviteUrl.trim());
+  } catch {
+    throw new Error("invite link is not a URL");
+  }
+  if (url.protocol !== "https:") throw new Error("invite link must be https");
+  if (url.username || url.password || url.search || url.hash) throw new Error("invite link has extra parts");
+  const path = url.pathname.replace(/\/+$/, "");
+  const at = path.lastIndexOf("/i/");
+  const match = at >= 0 ? INVITE_PATH.exec(path.slice(at)) : null;
+  if (!match) throw new Error("not an OwnPlace invite link");
+  const fingerprint = match[1];
+  const baseUrl = `${url.origin}${path.slice(0, at)}`;
+  let base: HttpsPorchStore;
+  try {
+    base = new HttpsPorchStore(baseUrl || url.origin, { fetch: opts.fetch });
+  } catch {
+    throw new Error("invite host refused");
+  }
+  let doc: Partial<InviteDocument>;
+  try {
+    doc = JSON.parse(new TextDecoder().decode(await base.readObject(`i/${fingerprint}.json`)));
+  } catch {
+    throw new Error("invite could not be loaded");
+  }
+  if (doc?.kind !== "invite" || doc.fingerprint !== fingerprint || typeof doc.porch !== "string") {
+    throw new Error("invite document is malformed");
+  }
+  let porchUrl: URL;
+  try {
+    porchUrl = new URL(doc.porch, `${baseUrl}/i/${fingerprint}`);
+  } catch {
+    throw new Error("invite document is malformed");
+  }
+  // Same origin only: an invite cannot send followers to someone else's host.
+  if (porchUrl.origin !== url.origin || porchUrl.search || porchUrl.hash) throw new Error("invite porch is on another host");
+  const address = porchUrl.href.replace(/\/+$/, "");
+  if (!isPorchAddress(address)) throw new Error("invite porch address is not allowed");
+  const porch = new HttpsPorchStore(address, { fetch: opts.fetch });
+  let ids: string[];
+  try {
+    ids = [...new Set((await porch.listObjects("timeline/")).map((p) => p.split("/")[1]))];
+  } catch {
+    throw new Error("invite porch could not be read");
+  }
+  for (const id of ids) {
+    let pkg: VerifiedHistoryPackage;
+    try {
+      pkg = await fetchVerifiedHistoryPackage(porch, id);
+    } catch {
+      continue;
+    }
+    let signer: string;
+    try {
+      signer = identityFingerprint(pkg.kinfolk.publicKey ?? "");
+    } catch {
+      continue;
+    }
+    if (signer !== fingerprint) continue;
+    const displayName = (pkg.kinfolk.displayName ?? "").trim().slice(0, 120) || inviteContactId(fingerprint);
+    return {
+      id: inviteContactId(fingerprint),
+      displayName,
+      addedAt: new Date().toISOString(),
+      address,
+      fingerprint,
+    };
+  }
+  throw new Error("invite porch has no verified post by this creator");
 }

@@ -425,3 +425,53 @@ test("public porch route serves only package files and round-trips to a follower
     await rm(follower, { recursive: true, force: true });
   }
 });
+
+test("invite routes are public-safe and follow-by-invite fails closed (#92)", async () => {
+  const { client, tmp } = await boot();
+  const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
+  process.env.OWNPLACE_IDENTITY_DIR = join(tmp, "ids");
+  try {
+    assert.equal((await client.request("GET", "/api/invite?backend=nextcloud-sim")).status, 404, "no invite before a signed post");
+    await publishStory(
+      { title: "Hi", body: "invite me", authorId: "kinfolk-rowan", authorName: "Rowan" },
+      { root: tmp },
+      { createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-invite-1" },
+    );
+    const info = await client.request("GET", "/api/invite?backend=nextcloud-sim");
+    assert.equal(info.status, 200);
+    const { fingerprint, path, displayName } = info.json as { fingerprint: string; path: string; displayName: string };
+    assert.match(fingerprint, /^[0-9a-f]{64}$/);
+    assert.equal(path, `i/${fingerprint}`);
+    assert.equal(displayName, "Rowan");
+    assert.equal((await client.request("GET", "/api/invite?backend=other")).status, 400);
+
+    const doc = await client.request("GET", `/i/${fingerprint}.json`);
+    assert.equal(doc.status, 200);
+    assert.deepEqual(doc.json, { protocol: "rooted/v0.1", kind: "invite", fingerprint, displayName: "Rowan", porch: "../porch/nextcloud-sim" });
+    assert.ok(!doc.raw.includes(tmp), "invite leaked a store path");
+    for (const bad of [`/i/${"0".repeat(64)}.json`, `/i/${fingerprint.toUpperCase()}.json`, "/i/abc.json", `/i/${fingerprint}x.json`]) {
+      assert.equal((await client.request("GET", bad)).status, 404, bad);
+    }
+    // Landing page path is recognized (HTML when the bundle is built).
+    assert.notEqual((await client.request("GET", `/i/${fingerprint}`)).status, 400);
+
+    const follow = (invite: unknown) => client.request("POST", "/api/contacts/invite", JSON.stringify({ invite }));
+    for (const [invite, msg] of [
+      [`https://10.0.0.5/i/${fingerprint}`, "invite host refused"],
+      [`http://porch.test/i/${fingerprint}`, "invite link must be https"],
+      ["https://porch.test/not-an-invite", "not an OwnPlace invite link"],
+    ] as const) {
+      const r = await follow(invite);
+      assert.equal(r.status, 400, invite);
+      assert.equal((r.json as { error: string }).error, msg);
+    }
+    assert.equal((await follow(42)).status, 400);
+    const contacts = ((await client.request("GET", "/api/contacts")).json as { contacts: unknown[] }).contacts;
+    assert.equal(contacts.length, 0, "failed follows add nothing");
+  } finally {
+    if (savedIds === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;
+    else process.env.OWNPLACE_IDENTITY_DIR = savedIds;
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});

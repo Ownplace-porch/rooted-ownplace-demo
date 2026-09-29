@@ -9,3 +9,11 @@ The publisher writes those four objects through the same `ObjectStore` interface
 OwnPlace reads the two folders through Vite's static demo directory and renders them as separate simulated backends. In a deployed app, the browser/client would use a configured adapter or a local sync layer rather than trusting a public static directory.
 
 `WebDavStore` and `GoogleDriveStore` are intentionally scaffolds. They fail loudly until a real, user-authorized implementation is supplied. This prevents the demo from implying that local folders are cloud integrations.
+
+Invitations (M12 #92): a creator is named by the lowercase hex SHA-256 of their Ed25519 public key (SPKI DER). The fingerprint stays stable when storage moves and reveals no location. `GET /i/<fp>` is a public landing page, and `GET /i/<fp>.json` is the invite document: fingerprint, display name, bio, and a porch path relative to the invite (`../porch/<backend>`). Following by invite (`POST /api/contacts/invite`, operator only) trusts nothing in that document:
+- The link must be https and pass the remote-porch host checks.
+- The porch must be same-origin with the invite.
+- The follow succeeds only if the porch holds a verified package whose signer's key fingerprint equals the link's. The contact's display name comes from that signed package.
+
+The contact is stored as `op-<first 12 hex>` with its `fingerprint`, so a later slice can enforce the pinned key on every read and survive a storage move.
+

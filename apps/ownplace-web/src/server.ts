@@ -31,6 +31,10 @@ import {
   publishStory,
   readContactFollowedTimeline,
   readVerifiedFollowedStory,
+  buildInviteDocument,
+  porchIdentity,
+  resolveInvite,
+  INVITE_PATH,
   readContacts,
   readVerifiedHistoryStory,
   removeContact,
@@ -357,6 +361,33 @@ const server = http.createServer(async (req, res) => {
       send(res, 201, result);
       return;
     }
+    if (req.method === "POST" && pathname === "/api/contacts/invite") {
+      if (!authorized(req)) {
+        send(res, 401, { error: "unauthorized" });
+        return;
+      }
+      let input: unknown;
+      try {
+        input = await readJsonBody(req);
+      } catch {
+        send(res, 400, { error: "invalid JSON body" });
+        return;
+      }
+      const invite = ((input ?? {}) as Record<string, unknown>).invite;
+      if (typeof invite !== "string" || invite.length > 400) {
+        send(res, 400, { error: "invite link is required" });
+        return;
+      }
+      try {
+        // resolveInvite only throws fixed, public-safe messages.
+        const contact = await resolveInvite(invite);
+        await addContact(simStore("nextcloud-sim"), contact);
+        send(res, 201, contact);
+      } catch (e) {
+        send(res, 400, { error: (e as Error).message });
+      }
+      return;
+    }
     if ((req.method === "POST" || req.method === "DELETE") && pathname === "/api/contacts") {
       if (!authorized(req)) {
         send(res, 401, { error: "unauthorized" });
@@ -396,6 +427,52 @@ const server = http.createServer(async (req, res) => {
         send(res, 400, { error: (e as Error).message });
         return;
       }
+      return;
+    }
+
+    // --- Invitations (M12 #92) ---
+    // Public-safe: fingerprint, display name, bio, and a relative porch
+    // path. No storage paths, tokens, or contacts.
+    if (req.method === "GET" && pathname === "/api/invite") {
+      const backend = url.searchParams.get("backend") ?? "nextcloud-sim";
+      if (backend !== "nextcloud-sim" && backend !== "google-drive-sim") {
+        send(res, 400, { error: "unknown backend" });
+        return;
+      }
+      const identity = await porchIdentity(simStore(backend));
+      if (!identity) {
+        send(res, 404, { error: "no signed identity on this porch yet" });
+        return;
+      }
+      send(res, 200, { ...identity, path: `i/${identity.fingerprint}` });
+      return;
+    }
+    if (req.method === "GET" && pathname.startsWith("/i/")) {
+      const json = pathname.endsWith(".json");
+      const m = INVITE_PATH.exec(json ? pathname.slice(0, -5) : pathname.replace(/\/$/, ""));
+      if (!m) {
+        send(res, 404, { error: "not found" });
+        return;
+      }
+      if (!json) {
+        // Landing page: the SPA renders it from the invite document.
+        try {
+          const data = await readFile(path.resolve(distDir, "index.html"));
+          res.writeHead(200, { "content-type": "text/html" });
+          res.end(data);
+        } catch {
+          send(res, 404, "not found", "text/plain");
+        }
+        return;
+      }
+      for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
+        const identity = await porchIdentity(simStore(backend));
+        if (identity?.fingerprint === m[1]) {
+          send(res, 200, buildInviteDocument(identity, backend));
+          return;
+        }
+      }
+      send(res, 404, { error: "not found" });
       return;
     }
 

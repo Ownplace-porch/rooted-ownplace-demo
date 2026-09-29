@@ -2,11 +2,14 @@ import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
 import { originLabel } from "./origin";
+import QRCode from "qrcode";
 
 type TimelineEntry = { id: string; title: string; authorId: string; createdAt: string; verified?: boolean; origin?: string };
 type Timeline = { stories: TimelineEntry[] };
 type Story = { id: string; title: string; body: string; createdAt: string; authorId: string; restricted?: unknown };
-type Contact = { id: string; displayName: string; addedAt: string; address?: string };
+type Contact = { id: string; displayName: string; addedAt: string; address?: string; fingerprint?: string };
+type InviteInfo = { fingerprint: string; displayName: string; bio?: string; path: string };
+type InviteDoc = { kind: "invite"; fingerprint: string; displayName: string; bio?: string };
 type ContactList = { contacts: Contact[] };
 
 const BACKENDS = ["nextcloud-sim", "google-drive-sim"];
@@ -244,6 +247,147 @@ function Contacts({ onChanged }: { onChanged?: () => void }) {
   );
 }
 
+
+// --- Invitations (M12 #92) ---
+
+function shortFingerprint(fp: string): string {
+  return fp.slice(0, 16).replace(/(.{4})(?=.)/g, "$1 ");
+}
+
+function useQr(text: string): string {
+  const [src, setSrc] = useState("");
+  useEffect(() => {
+    let live = true;
+    if (!text) return;
+    QRCode.toDataURL(text, { margin: 1, width: 220 }).then((url) => live && setSrc(url), () => live && setSrc(""));
+    return () => {
+      live = false;
+    };
+  }, [text]);
+  return src;
+}
+
+function YourInvite() {
+  const [info, setInfo] = useState<InviteInfo | null | undefined>(undefined);
+  const [copied, setCopied] = useState(false);
+  useEffect(() => {
+    fetch("/api/invite?backend=nextcloud-sim")
+      .then(async (res) => (res.ok ? ((await safeJson(res)) as InviteInfo | null) : null))
+      .then((v) => setInfo(v && typeof v.fingerprint === "string" ? v : null), () => setInfo(null));
+  }, []);
+  const link = info ? new URL(info.path, window.location.origin + "/").href : "";
+  const qr = useQr(link);
+  if (info === undefined) return null;
+  return (
+    <section className="composer">
+      <h2>Your invite</h2>
+      {info === null ? (
+        <p className="lede">Publish a post first. The invite is tied to the key that signs your posts.</p>
+      ) : (
+        <>
+          <p className="lede">
+            Share this link or QR code anywhere. It names you by key fingerprint{" "}
+            <code>{shortFingerprint(info.fingerprint)}…</code> and reveals no storage location.
+          </p>
+          <p>
+            <code>{link}</code>{" "}
+            <button
+              onClick={() => navigator.clipboard?.writeText(link).then(() => setCopied(true), () => setCopied(false))}
+            >
+              {copied ? "Copied" : "Copy link"}
+            </button>
+          </p>
+          {qr && <img src={qr} width={220} height={220} alt={`QR code for ${link}`} />}
+        </>
+      )}
+    </section>
+  );
+}
+
+function FollowByInvite({ onChanged }: { onChanged?: () => void }) {
+  const [invite, setInvite] = useState("");
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
+  async function follow(e: React.FormEvent) {
+    e.preventDefault();
+    setBusy(true);
+    setStatus("Checking the invite and verifying the creator's signature…");
+    try {
+      const res = await fetch("/api/contacts/invite", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ invite }),
+      });
+      const parsed = (await safeJson(res)) as (Contact & { error?: string }) | null;
+      if (!res.ok || !parsed) {
+        setStatus(`Couldn't follow: ${parsed?.error ?? res.status}`);
+        return;
+      }
+      setInvite("");
+      setStatus(`Following ${parsed.displayName} (verified key ${shortFingerprint(parsed.fingerprint ?? "")}…).`);
+      onChanged?.();
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <section className="composer">
+      <h2>Follow by invite</h2>
+      <p className="lede">Paste an OwnPlace invite link. The follow only succeeds if the porch has a post signed by that creator's key.</p>
+      <form onSubmit={follow}>
+        <input value={invite} onChange={(e) => setInvite(e.target.value)} placeholder="https://…/i/…" aria-label="Invite link" />
+        <button type="submit" disabled={busy || !invite.trim()}>Follow</button>
+      </form>
+      {status && <p className="date">{status}</p>}
+    </section>
+  );
+}
+
+function InviteLanding() {
+  const [doc, setDoc] = useState<InviteDoc | null | undefined>(undefined);
+  const [copied, setCopied] = useState(false);
+  const link = window.location.href.split(/[?#]/)[0].replace(/\/$/, "");
+  useEffect(() => {
+    fetch(`${link}.json`)
+      .then(async (res) => (res.ok ? ((await safeJson(res)) as InviteDoc | null) : null))
+      .then((v) => setDoc(v?.kind === "invite" ? v : null), () => setDoc(null));
+  }, [link]);
+  const qr = useQr(doc ? link : "");
+  return (
+    <main>
+      <header>
+        <p className="eyebrow">ROOTED / OWNPLACE · INVITATION</p>
+        {doc === undefined && <h1>Loading invite…</h1>}
+        {doc === null && <h1>This invite isn't available.</h1>}
+        {doc && (
+          <>
+            <h1>{doc.displayName} invited you to their porch.</h1>
+            {doc.bio && <p className="lede">{doc.bio}</p>}
+          </>
+        )}
+      </header>
+      {doc && (
+        <section className="composer">
+          <h2>How to follow</h2>
+          <ol>
+            <li>Open your own OwnPlace and log in.</li>
+            <li>Paste this link into <strong>Follow by invite</strong>.</li>
+            <li>Your OwnPlace checks that the posts are really signed by {doc.displayName}'s key before following.</li>
+          </ol>
+          <p>
+            <code>{link}</code>{" "}
+            <button onClick={() => navigator.clipboard?.writeText(link).then(() => setCopied(true), () => setCopied(false))}>
+              {copied ? "Copied" : "Copy link"}
+            </button>
+          </p>
+          {qr && <img src={qr} width={220} height={220} alt={`QR code for ${link}`} />}
+          <p className="date">Creator key fingerprint: <code>{doc.fingerprint}</code></p>
+          <p className="date">No wallet, token, or storage account is needed to follow.</p>
+        </section>
+      )}
+    </main>
+  );
+}
 
 function isHttpsUrl(u: unknown): u is string {
   return typeof u === "string" && u.startsWith("https://");
@@ -493,7 +637,9 @@ function App() {
             <button onClick={() => logout()}>Log out</button>
           </p>
           <Composer onPosted={() => setRefresh((n) => n + 1)} />
-          <Contacts onChanged={() => setRefresh((n) => n + 1)} />
+          <YourInvite />
+          <FollowByInvite onChanged={() => setRefresh((n) => n + 1)} />
+          <Contacts key={refresh} onChanged={() => setRefresh((n) => n + 1)} />
         </>
       )}
       <div className="grid">
@@ -506,6 +652,6 @@ function App() {
 }
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <App />
+    {/^\/i\/[0-9a-f]{64}\/?$/.test(window.location.pathname) ? <InviteLanding /> : <App />}
   </StrictMode>
 );

@@ -47,3 +47,7 @@ code { color: #53674c; }
   article > p { font-size: 16px; }
   .composer { padding: 16px; }
 }
+
+/* M12 #92: long invite links and fingerprints wrap instead of overflowing. */
+.composer code { overflow-wrap: anywhere; word-break: break-all; }
+.composer ol { padding-left: 1.4em; list-style: decimal; }
