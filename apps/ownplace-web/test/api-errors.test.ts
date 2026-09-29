@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -468,6 +468,46 @@ test("invite routes are public-safe and follow-by-invite fails closed (#92)", as
     assert.equal((await follow(42)).status, 400);
     const contacts = ((await client.request("GET", "/api/contacts")).json as { contacts: unknown[] }).contacts;
     assert.equal(contacts.length, 0, "failed follows add nothing");
+  } finally {
+    if (savedIds === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;
+    else process.env.OWNPLACE_IDENTITY_DIR = savedIds;
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// M14 #97: the creator's invite panel follows the signed identity when
+// nextcloud-sim is gone, agreeing with the /i/ link.
+test("/api/invite with no backend falls back to google-drive-sim like /i/ (#97)", async () => {
+  const { client, tmp } = await boot();
+  const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
+  process.env.OWNPLACE_IDENTITY_DIR = join(tmp, "ids");
+  try {
+    assert.equal((await client.request("GET", "/api/invite")).status, 404, "no invite before a signed post");
+    await publishStory(
+      { title: "Hi", body: "moved porch", authorId: "kinfolk-rowan", authorName: "Rowan" },
+      { root: tmp },
+      { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-invite-97" },
+    );
+    const before = await client.request("GET", "/api/invite");
+    assert.equal(before.status, 200);
+    const { fingerprint } = before.json as { fingerprint: string };
+    assert.equal(fingerprint, ((await client.request("GET", "/api/invite?backend=nextcloud-sim")).json as { fingerprint: string }).fingerprint);
+
+    await rename(join(tmp, "nextcloud-sim"), join(tmp, "nextcloud-sim.moved"));
+
+    const info = await client.request("GET", "/api/invite");
+    assert.equal(info.status, 200, "panel still finds the signed identity");
+    assert.equal((info.json as { fingerprint: string }).fingerprint, fingerprint);
+    assert.equal((info.json as { path: string }).path, `i/${fingerprint}`);
+    assert.ok(!info.raw.includes(tmp), "invite leaked a store path");
+
+    const doc = await client.request("GET", `/i/${fingerprint}.json`);
+    assert.equal(doc.status, 200);
+    assert.equal((doc.json as { porch: string }).porch, "../porch/google-drive-sim");
+
+    assert.equal((await client.request("GET", "/api/invite?backend=nextcloud-sim")).status, 404);
+    assert.equal((await client.request("GET", "/api/invite?backend=other")).status, 400);
   } finally {
     if (savedIds === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;
     else process.env.OWNPLACE_IDENTITY_DIR = savedIds;

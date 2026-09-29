@@ -65,6 +65,22 @@ function simStore(backend: string): LocalFolderStore {
   return new LocalFolderStore(path.resolve(storesRoot, backend));
 }
 
+// M14 #97: the one place that picks which backend holds the signed
+// identity, so the creator's invite panel and the /i/ link always agree.
+const INVITE_BACKENDS = ["nextcloud-sim", "google-drive-sim"] as const;
+
+async function findInviteIdentity(
+  fingerprint?: string,
+): Promise<{ identity: NonNullable<Awaited<ReturnType<typeof porchIdentity>>>; backend: string } | null> {
+  for (const backend of INVITE_BACKENDS) {
+    const identity = await porchIdentity(simStore(backend));
+    if (identity && (fingerprint === undefined || identity.fingerprint === fingerprint)) {
+      return { identity, backend };
+    }
+  }
+  return null;
+}
+
 class BodyTooLargeError extends Error {
   constructor() { super("body too large"); this.name = "BodyTooLargeError"; }
 }
@@ -434,12 +450,13 @@ const server = http.createServer(async (req, res) => {
     // Public-safe: fingerprint, display name, bio, and a relative porch
     // path. No storage paths, tokens, or contacts.
     if (req.method === "GET" && pathname === "/api/invite") {
-      const backend = url.searchParams.get("backend") ?? "nextcloud-sim";
-      if (backend !== "nextcloud-sim" && backend !== "google-drive-sim") {
+      // M14 #97: no backend => first backend holding a signed identity.
+      const backend = url.searchParams.get("backend");
+      if (backend !== null && backend !== "nextcloud-sim" && backend !== "google-drive-sim") {
         send(res, 400, { error: "unknown backend" });
         return;
       }
-      const identity = await porchIdentity(simStore(backend));
+      const identity = backend === null ? (await findInviteIdentity())?.identity : await porchIdentity(simStore(backend));
       if (!identity) {
         send(res, 404, { error: "no signed identity on this porch yet" });
         return;
@@ -465,12 +482,10 @@ const server = http.createServer(async (req, res) => {
         }
         return;
       }
-      for (const backend of ["nextcloud-sim", "google-drive-sim"]) {
-        const identity = await porchIdentity(simStore(backend));
-        if (identity?.fingerprint === m[1]) {
-          send(res, 200, buildInviteDocument(identity, backend));
-          return;
-        }
+      const found = await findInviteIdentity(m[1]);
+      if (found) {
+        send(res, 200, buildInviteDocument(found.identity, found.backend));
+        return;
       }
       send(res, 404, { error: "not found" });
       return;
