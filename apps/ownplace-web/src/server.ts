@@ -72,8 +72,8 @@ function simStore(backend: string): LocalFolderStore {
   return new LocalFolderStore(path.resolve(storesRoot, backend));
 }
 
-// M14 #97: the one place that picks which backend holds the signed
-// identity, so the creator's invite panel and the /i/ link always agree.
+// M14 #97: finds the backend holding a signed identity. M15 #100: only the
+// /i/<fp> link searches both porches; the invite panel reads the operator's.
 const INVITE_BACKENDS = ["nextcloud-sim", "google-drive-sim"] as const;
 
 async function findInviteIdentity(
@@ -467,13 +467,14 @@ const server = http.createServer(async (req, res) => {
     // Public-safe: fingerprint, display name, bio, and a relative porch
     // path. No storage paths, tokens, or contacts.
     if (req.method === "GET" && pathname === "/api/invite") {
-      // M14 #97: no backend => first backend holding a signed identity.
+      // M15 #100: no backend => the operator's own porch only. The two
+      // porches are two people, so the panel never falls back to the other.
       const backend = url.searchParams.get("backend");
       if (backend !== null && backend !== "nextcloud-sim" && backend !== "google-drive-sim") {
         send(res, 400, { error: "unknown backend" });
         return;
       }
-      const identity = backend === null ? (await findInviteIdentity())?.identity : await porchIdentity(simStore(backend));
+      const identity = await porchIdentity(simStore(backend ?? operatorPorch));
       if (!identity) {
         send(res, 404, { error: "no signed identity on this porch yet" });
         return;

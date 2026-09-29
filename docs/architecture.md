@@ -19,7 +19,7 @@ Invitations (M12 #92): a creator is named by the lowercase hex SHA-256 of their 
 
 The contact is stored as `op-<first 12 hex>` with its `fingerprint`, so a later slice can enforce the pinned key on every read and survive a storage move.
 
-Which porch an invite names (M14 #97): one server helper checks `nextcloud-sim`, then `google-drive-sim`, and uses the first that holds a signed identity. Both `GET /i/<fp>.json` and the creator's own `GET /api/invite` (no `backend` parameter, used by the **Your invite** panel) go through it, so the panel and the link always agree, including after `nextcloud-sim` is gone. `GET /api/invite?backend=<name>` still reads only that backend (400 unknown, 404 no identity).
+Which porch an invite names (M14 #97, revised in M15 #100): `GET /i/<fp>.json` checks `nextcloud-sim`, then `google-drive-sim`, and names the porch whose signed identity has that fingerprint, so each Kinfolk's own invite link resolves to their own porch. The **Your invite** panel's `GET /api/invite` (no `backend` parameter) reads only the operator's porch and returns 404 until the operator has posted. #97 let it fall back to the other folder, which assumed both folders held one person; with two Kinfolk that fallback would hand the operator someone else's invite. `GET /api/invite?backend=<name>` still reads only that backend (400 unknown, 404 no identity).
 
 Pinned identity and porch moves (M13 #94): a contact followed by invite keeps its `fingerprint` and `invite` link.
 - **Pinning:** on every read, and on story open, that porch only contributes packages whose signer key matches the pin. Anything else is skipped as `signer does not match followed creator`, and it still owns its id so nothing can fall through.

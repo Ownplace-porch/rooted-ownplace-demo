@@ -494,25 +494,26 @@ test("invite routes are public-safe and follow-by-invite fails closed (#92)", as
 
 // M14 #97: the creator's invite panel follows the signed identity when
 // nextcloud-sim is gone, agreeing with the /i/ link.
-test("/api/invite with no backend falls back to google-drive-sim like /i/ (#97)", async () => {
+test("/api/invite with no backend shows only the operator's invite; /i/ serves both (#97, #100)", async () => {
   const { client, tmp } = await boot();
   const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
   process.env.OWNPLACE_IDENTITY_DIR = join(tmp, "ids");
   try {
     assert.equal((await client.request("GET", "/api/invite")).status, 404, "no invite before a signed post");
-    // M15 #100: only Sam has posted, so only Sam's porch holds an identity.
+    // M15 #100: only Sam has posted. The operator (Alex) must not be handed
+    // Sam's invite: the two porches are two different people.
     await publishStory(
       { title: "Hi", body: "sam's porch", authorId: "kinfolk-sam", authorName: "Sam" },
       { root: tmp },
       { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-invite-97" },
     );
-    const info = await client.request("GET", "/api/invite");
-    assert.equal(info.status, 200, "panel still finds the signed identity");
-    const { fingerprint } = info.json as { fingerprint: string };
-    assert.equal(fingerprint, ((await client.request("GET", "/api/invite?backend=google-drive-sim")).json as { fingerprint: string }).fingerprint);
-    assert.equal((info.json as { path: string }).path, `i/${fingerprint}`);
-    assert.ok(!info.raw.includes(tmp), "invite leaked a store path");
+    assert.equal((await client.request("GET", "/api/invite")).status, 404, "panel never shows the other Kinfolk's invite");
+    const sam = await client.request("GET", "/api/invite?backend=google-drive-sim");
+    assert.equal(sam.status, 200);
+    const { fingerprint } = sam.json as { fingerprint: string };
+    assert.ok(!sam.raw.includes(tmp), "invite leaked a store path");
 
+    // Sam's own invite link still resolves to Sam's porch.
     const doc = await client.request("GET", `/i/${fingerprint}.json`);
     assert.equal(doc.status, 200);
     assert.equal((doc.json as { porch: string }).porch, "../porch/google-drive-sim");
@@ -520,14 +521,18 @@ test("/api/invite with no backend falls back to google-drive-sim like /i/ (#97)"
     assert.equal((await client.request("GET", "/api/invite?backend=nextcloud-sim")).status, 404);
     assert.equal((await client.request("GET", "/api/invite?backend=other")).status, 400);
 
-    // Once Alex posts, each Kinfolk's invite resolves to their own porch.
+    // Once Alex posts, the panel shows Alex's invite; each link resolves to its own porch.
     await publishStory(
       { title: "Hi", body: "alex's porch", authorId: "kinfolk-alex", authorName: "Alex Rowan" },
       { root: tmp },
       { createdAt: "2026-09-29T00:01:00.000Z", storyId: "story-invite-97-alex" },
     );
-    const alex = (await client.request("GET", "/api/invite")).json as { fingerprint: string };
+    const info = await client.request("GET", "/api/invite");
+    assert.equal(info.status, 200);
+    const alex = info.json as { fingerprint: string; path: string };
+    assert.equal(alex.fingerprint, ((await client.request("GET", "/api/invite?backend=nextcloud-sim")).json as { fingerprint: string }).fingerprint);
     assert.notEqual(alex.fingerprint, fingerprint);
+    assert.equal(alex.path, `i/${alex.fingerprint}`);
     assert.equal(((await client.request("GET", `/i/${alex.fingerprint}.json`)).json as { porch: string }).porch, "../porch/nextcloud-sim");
     assert.equal(((await client.request("GET", `/i/${fingerprint}.json`)).json as { porch: string }).porch, "../porch/google-drive-sim");
   } finally {
