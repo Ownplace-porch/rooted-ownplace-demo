@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { LocalFolderStore } from "@rooted/storage";
 import {
   addContact,
@@ -104,7 +104,8 @@ test("backendsFromEnv honors PUBLISH_ROOT and skips clouds by default", () => {
   process.env.PUBLISH_ROOT = "/tmp/x";
   try {
     const b = backendsFromEnv("/repo");
-    assert.equal(b.root, "/tmp/x");
+    // M16 #103: expect the OS-resolved form, as backendsFromEnv does (C:\tmp\x on Windows).
+    assert.equal(b.root, resolve("/tmp/x"));
     assert.equal(b.kevcloud, undefined);
     assert.equal(b.drive, undefined);
   } finally {
