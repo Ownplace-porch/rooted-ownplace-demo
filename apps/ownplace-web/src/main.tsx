@@ -1,11 +1,16 @@
 import { StrictMode, useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./style.css";
-import { originLabel } from "./origin";
+import { authorName, originLabel, wallLabel } from "./origin";
 import QRCode from "qrcode";
 
-type TimelineEntry = { id: string; title: string; authorId: string; createdAt: string; verified?: boolean; origin?: string };
-type Timeline = { stories: TimelineEntry[] };
+// M15 #101: signer and reply fields come from verified packages (server).
+type TimelineEntry = {
+  id: string; title: string; authorId: string; createdAt: string; verified?: boolean; origin?: string;
+  signer?: string; to?: { fingerprint: string }; inReplyTo?: { fingerprint: string; storyId: string };
+  sealed?: true; comments?: TimelineEntry[];
+};
+type Timeline = { owner?: string; stories: TimelineEntry[] };
 type Story = { id: string; title: string; body: string; createdAt: string; authorId: string; restricted?: unknown };
 type Contact = { id: string; displayName: string; addedAt: string; address?: string; fingerprint?: string };
 type InviteInfo = { fingerprint: string; displayName: string; bio?: string; path: string };
@@ -49,7 +54,7 @@ async function safeJson(res: Response): Promise<unknown | null> {
   }
 }
 
-async function loadTimeline(backend: string): Promise<TimelineEntry[]> {
+async function loadTimeline(backend: string): Promise<{ owner?: string; entries: TimelineEntry[] }> {
   // Server authenticates: entries derive from Ed25519-verified history
   // packages only. Unsigned or tampered entries are excluded server-side
   // and never rendered here.
@@ -59,13 +64,18 @@ async function loadTimeline(backend: string): Promise<TimelineEntry[]> {
   } catch {
     throw new Error("unreachable");
   }
-  if (res.status === 404) return [];
+  if (res.status === 404) return { entries: [] };
   if (!res.ok) throw new Error(`backend error ${res.status}`);
   const parsed = await safeJson(res);
   if (!parsed || typeof parsed !== "object" || !Array.isArray((parsed as Timeline).stories)) {
     throw new Error("malformed timeline");
   }
-  return sortEntries((parsed as Timeline).stories.filter(isEntry));
+  const owner = typeof (parsed as Timeline).owner === "string" ? (parsed as Timeline).owner : undefined;
+  const entries = sortEntries((parsed as Timeline).stories.filter(isEntry)).map((e) => ({
+    ...e,
+    comments: Array.isArray(e.comments) ? e.comments.filter(isEntry) : [],
+  }));
+  return { owner, entries };
 }
 
 async function loadStory(backend: string, id: string): Promise<Story | null> {
@@ -86,23 +96,26 @@ function useBackend(backend: string, refresh: number) {
     | { status: "loading" }
     | { status: "error"; message: string }
     | { status: "empty" }
-    | { status: "ready"; entries: TimelineEntry[]; stories: Record<string, Story> }
+    | { status: "ready"; owner?: string; entries: TimelineEntry[]; stories: Record<string, Story> }
   >({ status: "loading" });
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const list = await loadTimeline(backend);
+        const { owner, entries: list } = await loadTimeline(backend);
         if (list.length === 0) {
           if (!cancelled) setState({ status: "empty" });
           return;
         }
+        // Comments are verified stories too; load them like posts.
+        const ids = list.flatMap((e) => [e.id, ...(e.comments ?? []).map((c) => c.id)]);
         const pairs = await Promise.all(
-          list.map(async (e) => [e.id, await loadStory(backend, e.id)] as const)
+          ids.map(async (id) => [id, await loadStory(backend, id)] as const)
         );
         if (!cancelled) {
           setState({
             status: "ready",
+            owner,
             entries: list,
             stories: Object.fromEntries(pairs.filter(([, s]) => s !== null) as [string, Story][]),
           });
@@ -490,8 +503,92 @@ function Unlocker({ backend, id }: { backend: string; id: string }) {
   );
 }
 
-function BackendColumn({ backend, kinfolk, cloud, refresh }: { backend: string; kinfolk: string; cloud: string; refresh: number }) {
+// --- Comments and wall posts (M15 #101) ---
+// Both publish to the logged-in Kinfolk's own porch; the server checks the
+// target before signing.
+
+function ReplyBox({ label, placeholder, target, onDone }: {
+  label: string;
+  placeholder: string;
+  target: { inReplyTo: { fingerprint: string; storyId: string } } | { to: { fingerprint: string } };
+  onDone: () => void;
+}) {
+  const [body, setBody] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (busy || !body.trim()) return;
+    setBusy(true);
+    setStatus("");
+    try {
+      const res = await fetch("/api/post", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body, ...target }),
+      });
+      const parsed = (await safeJson(res)) as { error?: string } | null;
+      if (!res.ok) {
+        setStatus(`Couldn't post: ${parsed?.error ?? res.status}`);
+        return;
+      }
+      setBody("");
+      onDone();
+    } catch (err) {
+      setStatus(`Couldn't post: ${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <form className="reply-box" onSubmit={submit}>
+      <textarea value={body} onChange={(e) => setBody(e.target.value)} placeholder={placeholder} maxLength={5000} rows={2} aria-label={label} />
+      <button type="submit" disabled={busy || !body.trim()}>{busy ? "Posting…" : label}</button>
+      {status && <p className="date">{status}</p>}
+    </form>
+  );
+}
+
+function ReplyActions({ entry, canDelete, canHide, onDone }: { entry: TimelineEntry; canDelete: boolean; canHide: boolean; onDone: () => void }) {
+  const [status, setStatus] = useState("");
+  async function act(kind: "delete" | "hide") {
+    const ask = kind === "delete" ? "Delete this from your porch for everyone?" : "Hide this on your porch? The author's copy is not changed.";
+    if (!window.confirm(ask)) return;
+    setStatus("");
+    const res = kind === "delete"
+      ? await fetch(`/api/post?id=${encodeURIComponent(entry.id)}`, { method: "DELETE" })
+      : await fetch("/api/hidden", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fingerprint: entry.signer, storyId: entry.id }),
+      });
+    if (!res.ok) {
+      const parsed = (await safeJson(res)) as { error?: string } | null;
+      setStatus(`Couldn't ${kind}: ${parsed?.error ?? res.status}`);
+      return;
+    }
+    onDone();
+  }
+  if (!canDelete && !canHide) return null;
+  return (
+    <span className="reply-actions">
+      {canDelete && <button onClick={() => act("delete")}>Delete</button>}
+      {canHide && <button onClick={() => act("hide")}>Hide</button>}
+      {status && <span className="date">{status}</span>}
+    </span>
+  );
+}
+
+function BackendColumn({ backend, kinfolk, cloud, refresh, authed, operatorFp, onChanged }: {
+  backend: string; kinfolk: string; cloud: string; refresh: number;
+  authed: boolean; operatorFp?: string; onChanged: () => void;
+}) {
   const state = useBackend(backend, refresh);
+  // M15 #101: the operator writes and deletes as themselves; hiding happens
+  // only in the operator's own column, on replies aimed at them.
+  const mine = (e: TimelineEntry) => authed && operatorFp !== undefined && e.signer === operatorFp;
+  const hideable = (e: TimelineEntry, targetsOwner: boolean) =>
+    authed && backend === OPERATOR.backend && targetsOwner && operatorFp !== undefined && e.signer !== operatorFp;
   const [contacts, setContacts] = useState<Contact[]>([]);
   useEffect(() => {
     // M15 #100: origin labels come from this porch's own contacts.
@@ -525,14 +622,46 @@ function BackendColumn({ backend, kinfolk, cloud, refresh }: { backend: string; 
       )}
       {state.status === "ready" && (
         <>
+          {authed && backend !== OPERATOR.backend && state.owner && (
+            <ReplyBox
+              label={`Write on ${kinfolk}'s wall`}
+              placeholder={`Say something on ${kinfolk}'s wall`}
+              target={{ to: { fingerprint: state.owner } }}
+              onDone={onChanged}
+            />
+          )}
           {state.entries.map((e) => {
             const s = state.stories[e.id];
-            const from = originLabel(e.origin, backend, contacts, kinfolk);
+            const from = e.to
+              ? wallLabel(authorName(e.origin, backend, contacts, kinfolk), kinfolk)
+              : originLabel(e.origin, backend, contacts, kinfolk);
+            const ownerPost = state.owner !== undefined && e.signer === state.owner;
             return (
               <div key={e.id} className="story">
                 <p className="date">{formatDate(e.createdAt)} · verified signature{from ? ` · ${from}` : ""}</p>
-                <h3>{e.title}</h3>
+                {!e.to && <h3>{e.title}</h3>}
                 {s ? (s.restricted !== undefined ? <Unlocker backend={backend} id={e.id} /> : <p>{s.body}</p>) : <p>Story unavailable or failed verification for this entry.</p>}
+                {e.to && <ReplyActions entry={e} canDelete={mine(e)} canHide={hideable(e, true)} onDone={onChanged} />}
+                {(e.comments ?? []).length > 0 && (
+                  <ul className="comments">
+                    {(e.comments ?? []).map((c) => {
+                      const cs = state.stories[c.id];
+                      return (
+                        <li key={c.id}>
+                          <p className="date">
+                            {authorName(c.origin, backend, contacts, kinfolk)} · {formatDate(c.createdAt)} · verified signature
+                          </p>
+                          <p>{cs ? cs.body : "Comment unavailable or failed verification."}</p>
+                          <ReplyActions entry={c} canDelete={mine(c)} canHide={hideable(c, ownerPost)} onDone={onChanged} />
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+                {authed && e.signer && !e.sealed && (
+                  <ReplyBox label="Comment" placeholder="Write a comment" target={{ inReplyTo: { fingerprint: e.signer, storyId: e.id } }} onDone={onChanged} />
+                )}
+                {e.sealed && <p className="date">Comments on Kinfolk-only posts are not available yet.</p>}
                 <footer>
                   <code>{e.id}</code>
                 </footer>
@@ -616,9 +745,23 @@ function LoginForm({ onLogin, error }: { onLogin: (token: string) => void; error
   );
 }
 
+function useOperatorFingerprint(authed: boolean | null): string | undefined {
+  // M15 #101: shows Delete on the operator's own replies. The server still
+  // checks every delete against the operator's key.
+  const [fp, setFp] = useState<string | undefined>(undefined);
+  useEffect(() => {
+    if (!authed) return;
+    fetch("/api/invite")
+      .then(async (res) => (res.ok ? ((await safeJson(res)) as InviteInfo | null) : null))
+      .then((v) => setFp(typeof v?.fingerprint === "string" ? v.fingerprint : undefined), () => setFp(undefined));
+  }, [authed]);
+  return fp;
+}
+
 function App() {
   const [refresh, setRefresh] = useState(0);
   const { authed, loginError, login, logout } = useSession();
+  const operatorFp = useOperatorFingerprint(authed);
   return (
     <main>
       <header>
@@ -652,7 +795,16 @@ function App() {
       )}
       <div className="grid">
         {PORCHES.map((p) => (
-          <BackendColumn key={p.backend} backend={p.backend} kinfolk={p.kinfolk} cloud={p.cloud} refresh={refresh} />
+          <BackendColumn
+            key={p.backend}
+            backend={p.backend}
+            kinfolk={p.kinfolk}
+            cloud={p.cloud}
+            refresh={refresh}
+            authed={authed === true}
+            operatorFp={operatorFp}
+            onChanged={() => setRefresh((n) => n + 1)}
+          />
         ))}
       </div>
     </main>

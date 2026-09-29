@@ -5,7 +5,11 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 export type Kinfolk = { id: string; displayName: string; bio?: string; publicKey?: string };
-export type Story = { id: string; title: string; body: string; media: string[]; authorId: string; createdAt: string; restricted?: SealedBody };
+// M15 #101: a wall post points at a Kinfolk, a comment at a post. Both are
+// signed story fields, so the target is covered by the manifest signature.
+export type WallTarget = { fingerprint: string };
+export type ReplyTarget = { fingerprint: string; storyId: string };
+export type Story = { id: string; title: string; body: string; media: string[]; authorId: string; createdAt: string; restricted?: SealedBody; to?: WallTarget; inReplyTo?: ReplyTarget };
 export type ManifestObject = { path: string; sha256: string; contentType: string };
 export type Manifest = { protocolVersion: "0.1"; packageId: string; objects: ManifestObject[]; signing: "demo-placeholder" | "ed25519" };
 export type Signature = { algorithm: "demo-placeholder"; signedManifestSha256: string; note: string } | { algorithm: "ed25519"; signedManifestSha256: string; value: string };
