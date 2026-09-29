@@ -17,3 +17,8 @@ Invitations (M12 #92): a creator is named by the lowercase hex SHA-256 of their 
 
 The contact is stored as `op-<first 12 hex>` with its `fingerprint`, so a later slice can enforce the pinned key on every read and survive a storage move.
 
+Pinned identity and porch moves (M13 #94): a contact followed by invite keeps its `fingerprint` and `invite` link.
+- **Pinning:** on every read, and on story open, that porch only contributes packages whose signer key matches the pin. Anything else is skipped as `signer does not match followed creator`, and it still owns its id so nothing can fall through.
+- **Moves:** if the pinned porch is unreadable, or serves nothing signed by the pinned key, the follower re-resolves the stored invite under the M12 rules. If the invite now names a different porch with a post by the same key, that porch is used and the saved address is updated. The contact id, pin and invite stay the same, so there is no second follow and no duplicate.
+- **Limits:** this covers moves behind the same OwnPlace host. Moving to a new domain needs a creator-signed move notice (future).
+

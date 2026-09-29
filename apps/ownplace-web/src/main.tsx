@@ -231,6 +231,7 @@ function Contacts({ onChanged }: { onChanged?: () => void }) {
           <li key={c.id}>
             {c.displayName} <code>{c.id}</code>{" "}
             {c.address && <code>{c.address}</code>}{" "}
+            {c.fingerprint && <span className="date">verified key {shortFingerprint(c.fingerprint)}… </span>}
             <button onClick={() => remove(c.id)}>Unfollow</button>
           </li>
         ))}
