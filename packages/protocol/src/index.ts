@@ -56,6 +56,18 @@ export function loadOrCreateIdentity(id: string, directory = process.env.OWNPLAC
   return { privateKey, publicKey };
 }
 
+// M12 #92: canonical creator id. Lowercase hex SHA-256 of the Ed25519
+// public key (SPKI DER). Stable across storage moves; reveals no location.
+export function identityFingerprint(publicKeyPem: string): string {
+  const key = createPublicKey(publicKeyPem);
+  if (key.asymmetricKeyType !== "ed25519") throw new Error("identity key must be Ed25519");
+  return sha256(key.export({ type: "spki", format: "der" }));
+}
+
+export function isFingerprint(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
 export function signManifest(manifest: Manifest, privateKey: string): Signature {
   const key = createPrivateKey(privateKey);
   if (key.asymmetricKeyType !== "ed25519") throw new Error("Kinfolk private key must be Ed25519");

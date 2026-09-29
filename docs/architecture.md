@@ -9,3 +9,18 @@ The publisher writes those four objects through the same `ObjectStore` interface
 OwnPlace reads the two folders through Vite's static demo directory and renders them as separate simulated backends. In a deployed app, the browser/client would use a configured adapter or a local sync layer rather than trusting a public static directory.
 
 `WebDavStore` and `GoogleDriveStore` are intentionally scaffolds. They fail loudly until a real, user-authorized implementation is supplied. This prevents the demo from implying that local folders are cloud integrations.
+
+Invitations (M12 #92): a creator is named by the lowercase hex SHA-256 of their Ed25519 public key (SPKI DER). The fingerprint stays stable when storage moves and reveals no location. `GET /i/<fp>` is a public landing page, and `GET /i/<fp>.json` is the invite document: fingerprint, display name, bio, and a porch path relative to the invite (`../porch/<backend>`). Following by invite (`POST /api/contacts/invite`, operator only) trusts nothing in that document:
+- The link must be https and pass the remote-porch host checks.
+- The porch must be same-origin with the invite.
+- The follow succeeds only if the porch holds a verified package whose signer's key fingerprint equals the link's. The contact's display name comes from that signed package.
+
+The contact is stored as `op-<first 12 hex>` with its `fingerprint`, so a later slice can enforce the pinned key on every read and survive a storage move.
+
+Which porch an invite names (M14 #97): one server helper checks `nextcloud-sim`, then `google-drive-sim`, and uses the first that holds a signed identity. Both `GET /i/<fp>.json` and the creator's own `GET /api/invite` (no `backend` parameter, used by the **Your invite** panel) go through it, so the panel and the link always agree, including after `nextcloud-sim` is gone. `GET /api/invite?backend=<name>` still reads only that backend (400 unknown, 404 no identity).
+
+Pinned identity and porch moves (M13 #94): a contact followed by invite keeps its `fingerprint` and `invite` link.
+- **Pinning:** on every read, and on story open, that porch only contributes packages whose signer key matches the pin. Anything else is skipped as `signer does not match followed creator`, and it still owns its id so nothing can fall through.
+- **Moves:** if the pinned porch is unreadable, or serves nothing signed by the pinned key, the follower re-resolves the stored invite under the M12 rules. If the invite now names a different porch with a post by the same key, that porch is used and the saved address is updated. The contact id, pin and invite stay the same, so there is no second follow and no duplicate.
+- **Limits:** this covers moves behind the same OwnPlace host. Moving to a new domain needs a creator-signed move notice (future).
+
