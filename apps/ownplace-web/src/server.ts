@@ -24,6 +24,8 @@
 // with a console warning (dev convenience, not a claim).
 // M16 #116: reads decrypt encrypted posts only for an authenticated request;
 // anyone else gets the stranger's view, where encrypted posts are left out.
+// With no token, reads never decrypt unless OWNPLACE_DEV_MODE=1 is set
+// explicitly (warned at startup). Writes keep the token-less dev behavior.
 
 import { randomBytes } from "node:crypto";
 import http from "node:http";
@@ -73,6 +75,16 @@ const writeToken = process.env.OWNPLACE_WRITE_TOKEN ?? "";
 
 if (!writeToken) {
   console.warn("OWNPLACE_WRITE_TOKEN unset: write endpoints are open (local dev mode)");
+}
+
+// M16 #116: decryption fails closed. Only an explicit opt-in lets a
+// token-less copy decrypt reads, because it would do so for anyone who can
+// reach it (a tailscale serve or proxy hop looks like loopback).
+const devMode = process.env.OWNPLACE_DEV_MODE === "1";
+if (devMode && !writeToken) {
+  console.warn("OWNPLACE_DEV_MODE=1 and no OWNPLACE_WRITE_TOKEN: reads decrypt encrypted posts for anyone who can reach this server");
+} else if (devMode) {
+  console.warn("OWNPLACE_DEV_MODE=1 is ignored for reads: OWNPLACE_WRITE_TOKEN is set, so decrypting needs a login");
 }
 
 // Single shared stores root for reads AND writes (backendsFromEnv):
@@ -204,9 +216,14 @@ function authorized(req: http.IncomingMessage): boolean {
 }
 
 // M16 #116: each column is read as its porch's owner, with that owner's
-// X25519 key from this machine, and only for an authenticated request.
+// X25519 key from this machine. With a token, only a logged-in request
+// decrypts; without one, only an explicit OWNPLACE_DEV_MODE=1 does.
+function canDecrypt(req: http.IncomingMessage): boolean {
+  return writeToken ? isAuthenticated(req) : devMode;
+}
+
 function readerKeyFor(req: http.IncomingMessage, backend: string): string | undefined {
-  return isAuthenticated(req) ? porchReaderKey(backend) : undefined;
+  return canDecrypt(req) ? porchReaderKey(backend) : undefined;
 }
 
 const MIME: Record<string, string> = {

@@ -273,7 +273,7 @@ test("web API sealed open serves media to the entitled key only (#66)", async ()
     );
 
     // 4. Public stories open without a key, unchanged shape.
-    const posted = await client.request("POST", "/api/post", JSON.stringify({ title: "Open post", body: "open words" }));
+    const posted = await client.request("POST", "/api/post", JSON.stringify({ title: "Open post", body: "open words", public: true }));
     assert.equal(posted.status, 201);
     const pubId = ((posted.json ?? {}) as { storyId?: unknown }).storyId;
     assert.equal(typeof pubId, "string");
@@ -547,7 +547,8 @@ test("/api/invite with no backend shows only the operator's invite; /i/ serves b
 
 test("web composer posts as the logged-in Kinfolk only, to their porch only (#100)", async () => {
   const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
-  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids });
+  // M16 #116: reading back encrypted posts without a token needs dev mode.
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids, OWNPLACE_DEV_MODE: "1" });
   try {
     for (const body of [
       { title: "t", body: "b", authorId: "kinfolk-sam" },
@@ -578,7 +579,8 @@ test("web composer posts as the logged-in Kinfolk only, to their porch only (#10
 // attach on read, and delete/hide with fixed, leak-free errors.
 test("web comments, wall posts, delete and hide between Alex and Sam (#101)", async () => {
   const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
-  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids });
+  // M16 #116: reading back encrypted posts without a token needs dev mode.
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids, OWNPLACE_DEV_MODE: "1" });
   const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
   process.env.OWNPLACE_IDENTITY_DIR = ids;
   try {
@@ -670,7 +672,7 @@ const JORDAN = { OWNPLACE_OPERATOR_ID: "kinfolk-jordan", OWNPLACE_OPERATOR_NAME:
 
 test("OWNPLACE_OPERATOR_* makes the web operator Jordan; posting as Alex is refused (#111)", async () => {
   const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
-  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids, ...JORDAN });
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids, OWNPLACE_DEV_MODE: "1", ...JORDAN });
   try {
     for (const body of [
       { title: "t", body: "b", authorId: "kinfolk-alex" },
@@ -814,5 +816,57 @@ test("encrypted posts: porch serves ciphertext and keys.json, only a logged-in r
     await rm(tmp, { recursive: true, force: true });
     await rm(ids, { recursive: true, force: true });
     await rm(follower, { recursive: true, force: true });
+  }
+});
+
+// M16 #116 review: decryption fails closed. A token-less copy serves the
+// stranger's view unless OWNPLACE_DEV_MODE=1 is set; with a token, only a
+// logged-in read decrypts. Writes keep the token-less dev behavior.
+async function decryptCase(env: Record<string, string>, headers?: Record<string, string>) {
+  const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids, ...env });
+  try {
+    const posted = await client.request("POST", "/api/post", JSON.stringify({ title: "Harvest plans", body: "Meet at the barn at dawn" }), headers);
+    assert.equal(posted.status, 201, "writes keep working");
+    const id = (posted.json as { storyId: string }).storyId;
+    const timeline = await client.request("GET", "/api/timeline?backend=nextcloud-sim", undefined, headers);
+    const story = await client.request("GET", `/api/story?backend=nextcloud-sim&id=${id}`, undefined, headers);
+    return { id, timeline, story };
+  } finally {
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+    await rm(ids, { recursive: true, force: true });
+  }
+}
+
+test("no token and no OWNPLACE_DEV_MODE: reads do not decrypt (#116)", async () => {
+  const { id, timeline, story } = await decryptCase({});
+  assert.deepEqual((timeline.json as { stories: unknown[] }).stories, []);
+  assert.ok((timeline.json as { skipped: { id: string; reason: string }[] }).skipped.some((s) => s.id === id && s.reason === ENCRYPTED_POST));
+  assert.ok(!timeline.raw.includes("Harvest"));
+  assertError(story, 404, { error: "not found" });
+});
+
+test("no token with OWNPLACE_DEV_MODE=1: reads decrypt (#116)", async () => {
+  const { id, timeline, story } = await decryptCase({ OWNPLACE_DEV_MODE: "1" });
+  assert.equal((timeline.json as { stories: { id: string; title: string }[] }).stories.find((s) => s.id === id)?.title, "Harvest plans");
+  assert.equal((story.json as { body: string }).body, "Meet at the barn at dawn");
+});
+
+test("token set: an authenticated read decrypts, even with OWNPLACE_DEV_MODE=1 an anonymous one does not (#116)", async () => {
+  const authed = await decryptCase({ OWNPLACE_WRITE_TOKEN: "t" }, { authorization: "Bearer t" });
+  assert.equal((authed.timeline.json as { stories: { id: string; title: string }[] }).stories.find((s) => s.id === authed.id)?.title, "Harvest plans");
+  assert.equal((authed.story.json as { body: string }).body, "Meet at the barn at dawn");
+  const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids, OWNPLACE_WRITE_TOKEN: "t", OWNPLACE_DEV_MODE: "1" });
+  try {
+    const posted = await client.request("POST", "/api/post", JSON.stringify({ title: "Harvest plans", body: "b" }), { authorization: "Bearer t" });
+    const anon = await client.request("GET", "/api/timeline?backend=nextcloud-sim");
+    assert.ok(!anon.raw.includes("Harvest"), "dev mode never overrides a token");
+    assert.ok((anon.json as { skipped: { id: string }[] }).skipped.some((s) => s.id === (posted.json as { storyId: string }).storyId));
+  } finally {
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+    await rm(ids, { recursive: true, force: true });
   }
 });
