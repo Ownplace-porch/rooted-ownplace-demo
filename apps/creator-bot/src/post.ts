@@ -36,6 +36,25 @@ function fail(message: string): never {
   process.exit(2);
 }
 
+// M15 #113: refuse unknown flags and stray arguments before anything is read
+// or signed, so a typo like --author can't silently post as the operator.
+const VALUE_FLAGS = new Set(["title", "body", "author-id", "author-name", "reply-to", "wall", "entitle-reader", "reader-pubkey", "entitle-readers"]);
+const BOOLEAN_FLAGS = new Set(["members-only"]);
+
+function checkArgs(argv: string[]): void {
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (!token.startsWith("--")) fail(`unexpected argument: ${token}`);
+    const name = token.slice(2);
+    if (BOOLEAN_FLAGS.has(name)) continue;
+    if (!VALUE_FLAGS.has(name)) fail(`unknown flag: ${token}`);
+    // A missing value (next token is a flag) is left to the per-flag checks below.
+    if (argv[i + 1] !== undefined && !argv[i + 1].startsWith("--")) i++;
+  }
+}
+
+checkArgs(process.argv.slice(2));
+
 // M15 #111: invalid OWNPLACE_OPERATOR_* settings refuse startup.
 requireOperatorSettings();
 

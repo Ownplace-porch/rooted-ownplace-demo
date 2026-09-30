@@ -316,3 +316,28 @@ test("post refuses to start with an invalid OWNPLACE_OPERATOR_ID and writes noth
     await rm(tmp, { recursive: true, force: true });
   }
 });
+
+// M15 #113: a mistyped flag must not silently post as the operator.
+test("post refuses unknown flags and stray arguments with usage and writes nothing (#113)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
+  const env = { OWNPLACE_IDENTITY_DIR: join(tmp, "ids") };
+  try {
+    const cases: [string[], RegExp][] = [
+      [["--author", "kinfolk-sam", "--title", "t", "--body", "b"], /post failed: unknown flag: --author\n/],
+      [["--title", "t", "--body", "b", "--author-id=kinfolk-sam"], /post failed: unknown flag: --author-id=kinfolk-sam\n/],
+      [["--title", "t", "--body", "b", "--members-only", "--members"], /post failed: unknown flag: --members\n/],
+      [["--title", "t", "--body", "two", "words"], /post failed: unexpected argument: words\n/],
+    ];
+    for (const [args, message] of cases) {
+      await assert.rejects(runPost(tmp, args, env),
+        (e: { code?: number; stderr?: string }) => e.code === 2 && message.test(e.stderr ?? "") && /usage: npm run post/.test(e.stderr ?? ""));
+    }
+    await assert.rejects(access(join(tmp, "nextcloud-sim")), "a refused post writes nothing to the operator's porch");
+    await assert.rejects(access(join(tmp, "google-drive-sim")), "a refused post writes nothing to Sam's porch");
+    // Every documented flag is still accepted.
+    const { stdout } = await runPost(tmp, ["--title", "t", "--body", "b", "--author-id", "kinfolk-alex", "--author-name", "Alex", "--members-only"], env);
+    assert.match(stdout, /done: nextcloud-sim .*author=kinfolk-alex/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
