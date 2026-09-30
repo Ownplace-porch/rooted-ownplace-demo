@@ -239,9 +239,9 @@ test("per-porch verify: a package on Sam's porch signed by another key fails", a
 
 test("per-porch verify: tampered history fails its own porch only", async () => {
   await withSeededDemo(async (root) => {
-    await writeFile(join(root, "nextcloud-sim", "timeline", "story-first-light", "story.json"), "{not json");
+    await writeFile(join(root, "nextcloud-sim", "timeline", "story-6b1f0e9a4c2d47d8a35e1c7f90b2d4e6", "story.json"), "{not json");
     const report = await verifyStores(root);
-    assert.match(problemsOf(report, "nextcloud-sim"), /history story-first-light: invalid JSON: story\.json/);
+    assert.match(problemsOf(report, "nextcloud-sim"), /history story-6b1f0e9a4c2d47d8a35e1c7f90b2d4e6: invalid JSON: story\.json/);
     // Sam still verifies his own porch; his view of Alex reports the bad entry.
     assert.ok(!/history/.test(problemsOf(report, "google-drive-sim")));
   });

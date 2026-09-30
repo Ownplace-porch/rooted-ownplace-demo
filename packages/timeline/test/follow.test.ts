@@ -46,7 +46,7 @@ test("follow broadcast: porch post plus creator video reach both kinfolk", async
     await publishStory(
       { title: "Porch news", body: "hello from alex", authorId: "kinfolk-alex", authorName: "Alex" },
       { root: rootA },
-      { createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-alex-1" },
+      { public: true, createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-alex-1" },
     );
 
     // 2. Fake creator posts a video for both kinfolk (sealed to subscribers).
@@ -139,7 +139,7 @@ test("follow merge: bad labels rejected, empty merge empty, id squats keep first
       await publishStory(
         { title, body: "dup", authorId: "kinfolk-x", authorName: "X" },
         { root },
-        { createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-dup-1" },
+        { public: true, createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-dup-1" },
       );
     }
     const aFirst = await readFollowedTimelines(
@@ -177,17 +177,17 @@ test("contact follow: own plus two local porches merge; tamper and escape stay i
     await publishStory(
       { title: "Own", body: "mine", authorId: "kinfolk-me", authorName: "Me" },
       { root: dir },
-      { createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-own-1" },
+      { public: true, createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-own-1" },
     );
     await publishStory(
       { title: "Alex", body: "from alex", authorId: "kinfolk-alex", authorName: "Alex" },
       { root: join(dir, "porch-alex") },
-      { createdAt: "2026-09-24T00:02:00.000Z", storyId: "story-alex-1" },
+      { public: true, createdAt: "2026-09-24T00:02:00.000Z", storyId: "story-alex-1" },
     );
     await publishStory(
       { title: "Sam", body: "from sam", authorId: "kinfolk-sam", authorName: "Sam" },
       { root: join(dir, "porch-sam") },
-      { createdAt: "2026-09-24T00:01:00.000Z", storyId: "story-sam-1" },
+      { public: true, createdAt: "2026-09-24T00:01:00.000Z", storyId: "story-sam-1" },
     );
     await addContact(own, validateContact({
       id: "porch-alex", displayName: "Alex", address: "local:porch-alex/nextcloud-sim",
@@ -221,7 +221,7 @@ test("contact follow: own plus two local porches merge; tamper and escape stay i
     await publishStory(
       { title: "Outside", body: "nope", authorId: "kinfolk-out", authorName: "Out" },
       { root: outside },
-      { createdAt: "2026-09-24T00:04:00.000Z", storyId: "story-outside-1" },
+      { public: true, createdAt: "2026-09-24T00:04:00.000Z", storyId: "story-outside-1" },
     );
     await symlink(outside, join(dir, "via-parent"));
     await addContact(own, validateContact({
@@ -259,12 +259,12 @@ test("contact follow: unverified own id does not fall through to a squat", async
     await publishStory(
       { title: "Own dup", body: "own", authorId: "kinfolk-me", authorName: "Me" },
       { root: dir },
-      { createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-dup-1" },
+      { public: true, createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-dup-1" },
     );
     await publishStory(
       { title: "Squat", body: "not mine", authorId: "kinfolk-alex", authorName: "Alex" },
       { root: join(dir, "porch-alex") },
-      { createdAt: "2026-09-24T00:01:00.000Z", storyId: "story-dup-1" },
+      { public: true, createdAt: "2026-09-24T00:01:00.000Z", storyId: "story-dup-1" },
     );
     await addContact(own, validateContact({
       id: "porch-alex", displayName: "Alex", address: "local:porch-alex/nextcloud-sim",
@@ -290,13 +290,13 @@ test("contact follow: in-porch timeline symlink is not followed or filled", asyn
     await publishStory(
       { title: "Outside", body: "leaked", authorId: "kinfolk-out", authorName: "Out" },
       { root: outside },
-      { createdAt: "2026-09-24T00:04:00.000Z", storyId: "story-link-1" },
+      { public: true, createdAt: "2026-09-24T00:04:00.000Z", storyId: "story-link-1" },
     );
     const porchRoot = join(dir, "porch-link");
     await publishStory(
       { title: "Kept", body: "stays", authorId: "kinfolk-link", authorName: "Link" },
       { root: porchRoot },
-      { createdAt: "2026-09-24T00:01:00.000Z", storyId: "story-kept-1" },
+      { public: true, createdAt: "2026-09-24T00:01:00.000Z", storyId: "story-kept-1" },
     );
     await mkdir(join(porchRoot, "nextcloud-sim/timeline"), { recursive: true });
     await symlink(
@@ -306,13 +306,13 @@ test("contact follow: in-porch timeline symlink is not followed or filled", asyn
     await publishStory(
       { title: "Fill", body: "should not fill", authorId: "kinfolk-fill", authorName: "Fill" },
       { root: join(dir, "porch-fill") },
-      { createdAt: "2026-09-24T00:05:00.000Z", storyId: "story-link-1" },
+      { public: true, createdAt: "2026-09-24T00:05:00.000Z", storyId: "story-link-1" },
     );
     const own = new LocalFolderStore(join(dir, "nextcloud-sim"));
     await publishStory(
       { title: "Own", body: "mine", authorId: "kinfolk-me", authorName: "Me" },
       { root: dir },
-      { createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-own-1" },
+      { public: true, createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-own-1" },
     );
     await addContact(own, validateContact({
       id: "porch-link", displayName: "A Link", address: "local:porch-link/nextcloud-sim",

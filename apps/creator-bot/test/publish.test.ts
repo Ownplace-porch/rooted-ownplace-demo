@@ -12,6 +12,9 @@ const run = promisify(execFile);
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const publishEntry = "apps/creator-bot/src/index.ts";
 const postEntry = "apps/creator-bot/src/post.ts";
+// M16 #116: seed story ids are opaque.
+const ALEX_SEED = "story-6b1f0e9a4c2d47d8a35e1c7f90b2d4e6";
+const SAM_SEED = "story-c83d5a17e2f94b06b9d1a4e7f3c50a28";
 
 function cleanEnv(tmp: string): NodeJS.ProcessEnv {
   const env: Record<string, string | undefined> = { ...process.env, PUBLISH_ROOT: tmp };
@@ -40,10 +43,15 @@ test("publisher seeds two Kinfolk, one porch each, following each other (#100)",
     assert.equal(sam.id, "kinfolk-sam");
     assert.notEqual(alex.publicKey, sam.publicKey, "two Kinfolk, two keys");
     // Each story lives on its author's porch only.
-    assert.equal((await readJson(tmp, "nextcloud-sim", "timeline", "story-first-light", "story.json")).authorId, "kinfolk-alex");
-    assert.equal((await readJson(tmp, "google-drive-sim", "timeline", "story-garden-table", "story.json")).authorId, "kinfolk-sam");
-    await assert.rejects(access(join(tmp, "nextcloud-sim", "timeline", "story-garden-table")));
-    await assert.rejects(access(join(tmp, "google-drive-sim", "timeline", "story-first-light")));
+    assert.equal((await readJson(tmp, "nextcloud-sim", "timeline", ALEX_SEED, "story.json")).authorId, "kinfolk-alex");
+    assert.equal((await readJson(tmp, "google-drive-sim", "timeline", SAM_SEED, "story.json")).authorId, "kinfolk-sam");
+    await assert.rejects(access(join(tmp, "nextcloud-sim", "timeline", SAM_SEED)));
+    // M16 #116: both seed stories are encrypted, with a wrap file beside them.
+    for (const [porch, id] of [["nextcloud-sim", ALEX_SEED], ["google-drive-sim", SAM_SEED]]) {
+      assert.deepEqual(Object.keys(await readJson(tmp, porch, "timeline", id, "story.json")).sort(), ["authorId", "encrypted", "id"]);
+      assert.equal((await readJson(tmp, porch, "keys.json")).epochs[0].wraps.length, 2, `${porch}: owner plus the mutual follow`);
+    }
+    await assert.rejects(access(join(tmp, "google-drive-sim", "timeline", ALEX_SEED)));
     // Each follows the other at a local: address, pinned to the other's key.
     const alexFollows = (await readJson(tmp, "nextcloud-sim", "contacts.json")).contacts;
     const samFollows = (await readJson(tmp, "google-drive-sim", "contacts.json")).contacts;
@@ -53,9 +61,9 @@ test("publisher seeds two Kinfolk, one porch each, following each other (#100)",
     assert.equal(samFollows[0].fingerprint, identityFingerprint(alex.publicKey));
 
     // Re-running is idempotent: same bytes, no duplicate follows.
-    const before = await readFile(join(tmp, "google-drive-sim", "timeline", "story-garden-table", "signature.json"));
+    const before = await readFile(join(tmp, "google-drive-sim", "timeline", SAM_SEED, "signature.json"));
     await run(process.execPath, ["--import", "tsx", publishEntry], { cwd: repoRoot, env });
-    assert.deepStrictEqual(await readFile(join(tmp, "google-drive-sim", "timeline", "story-garden-table", "signature.json")), before);
+    assert.deepStrictEqual(await readFile(join(tmp, "google-drive-sim", "timeline", SAM_SEED, "signature.json")), before);
     assert.equal((await readJson(tmp, "nextcloud-sim", "contacts.json")).contacts.length, 1);
   } finally {
     await rm(tmp, { recursive: true, force: true });
@@ -81,9 +89,11 @@ test("publisher preserves timeline history across a publish cycle (#41)", async 
       env: cleanEnv(tmp),
     });
     // 3. Timeline history survives on Alex's porch (the post's author).
+    // M16 #116: the post is encrypted, so the kept package shows ids only.
     for (const backend of ["nextcloud-sim"]) {
       const kept = JSON.parse(await readFile(join(tmp, backend, "timeline", id, "story.json"), "utf8"));
-      assert.equal(kept.title, "Keep me");
+      assert.equal(kept.authorId, "kinfolk-alex");
+      assert.ok(kept.encrypted, "kept post is still the encrypted package");
       const index = JSON.parse(await readFile(join(tmp, backend, "timeline.json"), "utf8"));
       assert.ok(
         index.stories.some((s: { id: string }) => s.id === id),
@@ -111,7 +121,7 @@ test("publish and verify seed the OWNPLACE_OPERATOR_* Kinfolk on the operator's 
     assert.equal(jordan.id, "kinfolk-jordan");
     assert.equal(jordan.displayName, "Jordan");
     assert.equal(jordan.bio, "Joined by QR code.");
-    assert.equal((await readJson(tmp, "nextcloud-sim", "timeline", "story-first-light", "story.json")).authorId, "kinfolk-jordan");
+    assert.equal((await readJson(tmp, "nextcloud-sim", "timeline", ALEX_SEED, "story.json")).authorId, "kinfolk-jordan");
     assert.equal((await readJson(tmp, "google-drive-sim", "kinfolk.json")).displayName, "Sam", "Sam is unchanged");
     const samFollows = (await readJson(tmp, "google-drive-sim", "contacts.json")).contacts;
     assert.deepEqual(samFollows.map((c: { id: string; displayName: string; address: string }) => [c.id, c.displayName, c.address]),

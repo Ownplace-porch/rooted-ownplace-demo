@@ -1,15 +1,21 @@
 import type { SealedBody } from "./gated.js";
+import type { EncryptedContent } from "./epoch.js";
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type Kinfolk = { id: string; displayName: string; bio?: string; publicKey?: string };
+// M16 #116: encryptionKey is the Kinfolk's X25519 public key (SPKI PEM). It is
+// signed with the package, so a follower's key is bound to their identity.
+export type Kinfolk = { id: string; displayName: string; bio?: string; publicKey?: string; encryptionKey?: string };
 // M15 #101: a wall post points at a Kinfolk, a comment at a post. Both are
 // signed story fields, so the target is covered by the manifest signature.
 export type WallTarget = { fingerprint: string };
 export type ReplyTarget = { fingerprint: string; storyId: string };
 export type Story = { id: string; title: string; body: string; media: string[]; authorId: string; createdAt: string; restricted?: SealedBody; to?: WallTarget; inReplyTo?: ReplyTarget };
+// M16 #116: an encrypted post's signed story.json. Everything but the ids is
+// inside `encrypted`; readers decrypt it back into a Story.
+export type EncryptedStory = { id: string; authorId: string; encrypted: EncryptedContent };
 export type ManifestObject = { path: string; sha256: string; contentType: string };
 export type Manifest = { protocolVersion: "0.1"; packageId: string; objects: ManifestObject[]; signing: "demo-placeholder" | "ed25519" };
 export type Signature = { algorithm: "demo-placeholder"; signedManifestSha256: string; note: string } | { algorithm: "ed25519"; signedManifestSha256: string; value: string };
@@ -93,3 +99,4 @@ export function verifyManifestSignature(manifest: unknown, signature: unknown, k
 }
 export * from "./gated.js";
 export * from "./mediagated.js";
+export * from "./epoch.js";

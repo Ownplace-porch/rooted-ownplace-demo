@@ -40,9 +40,9 @@ async function withDemo(fn: (root: string) => Promise<void>): Promise<void> {
   try {
     // Same shape as `npm run publish`: one post each, following each other, pinned.
     await publishStory(validateInput({ title: "Alex post", body: "from alex", authorId: "kinfolk-alex" }), { root },
-      { createdAt: "2026-09-29T09:00:00.000Z", storyId: "story-alex-1" });
+      { public: true, createdAt: "2026-09-29T09:00:00.000Z", storyId: "story-alex-1" });
     await publishStory(validateInput({ title: "Sam post", body: "from sam", authorId: "kinfolk-sam" }), { root },
-      { createdAt: "2026-09-29T10:00:00.000Z", storyId: "story-sam-1" });
+      { public: true, createdAt: "2026-09-29T10:00:00.000Z", storyId: "story-sam-1" });
     for (const k of DEMO_KINFOLK) {
       for (const other of DEMO_KINFOLK) {
         if (other.id === k.id) continue;
@@ -68,7 +68,7 @@ async function samComments(root: string, storyId: string, body: string, replyId:
   const inReplyTo = await commentTargetFor(root, "google-drive-sim", storyId);
   const validated = validateInput({ body, authorId: "kinfolk-sam", inReplyTo });
   await checkReplyTarget(root, "google-drive-sim", validated);
-  return publishStory(validated, { root }, { createdAt: at, storyId: replyId });
+  return publishStory(validated, { root }, { public: true, createdAt: at, storyId: replyId });
 }
 
 const view = (root: string, porch: string) => readThreadedTimeline(root, porch, NOW);
@@ -100,7 +100,7 @@ test("Sam's wall post shows on Alex's wall, labeled as Sam's, and nowhere else",
     const to = await wallTargetFor(root, "google-drive-sim", "kinfolk-alex");
     const validated = validateInput({ body: "hello alex", authorId: "kinfolk-sam", to });
     await checkReplyTarget(root, "google-drive-sim", validated);
-    await publishStory(validated, { root }, { createdAt: "2026-09-29T12:00:00.000Z", storyId: "story-sam-w1" });
+    await publishStory(validated, { root }, { public: true, createdAt: "2026-09-29T12:00:00.000Z", storyId: "story-sam-w1" });
 
     const alex = await view(root, "nextcloud-sim");
     const wall = alex.stories.find((s) => s.id === "story-sam-w1");
@@ -210,13 +210,13 @@ test("only replies aimed at the owner, by someone else, can be hidden", async ()
     // Sam comments on Sam's own post; Alex comments on Sam's post too.
     await samComments(root, "story-sam-1", "self", "story-sam-c1");
     const alexOnSam = validateInput({ body: "hi sam", authorId: "kinfolk-alex", inReplyTo: await commentTargetFor(root, "nextcloud-sim", "story-sam-1") });
-    await publishStory(alexOnSam, { root }, { createdAt: "2026-09-29T11:10:00.000Z", storyId: "story-alex-c1" });
+    await publishStory(alexOnSam, { root }, { public: true, createdAt: "2026-09-29T11:10:00.000Z", storyId: "story-alex-c1" });
     const alexView = await view(root, "nextcloud-sim");
     assert.equal(hideableReply(alexView, { fingerprint: fp("kinfolk-sam"), storyId: "story-sam-c1" }), null, "comment on someone else's post");
     assert.equal(hideableReply(alexView, { fingerprint: fp("kinfolk-alex"), storyId: "story-alex-c1" }), null, "own reply: delete, not hide");
     // Alex's own comment under Alex's own post: still delete, never hide.
     await publishStory(validateInput({ body: "self", authorId: "kinfolk-alex", inReplyTo: { fingerprint: fp("kinfolk-alex"), storyId: "story-alex-1" } }), { root },
-      { createdAt: "2026-09-29T11:20:00.000Z", storyId: "story-alex-c2" });
+      { public: true, createdAt: "2026-09-29T11:20:00.000Z", storyId: "story-alex-c2" });
     const withOwn = await view(root, "nextcloud-sim");
     assert.deepEqual(comments(withOwn.stories, "story-alex-1").map(([id]) => id), ["story-alex-c2"]);
     assert.equal(hideableReply(withOwn, { fingerprint: fp("kinfolk-alex"), storyId: "story-alex-c2" }), null, "own comment on own post");
@@ -254,7 +254,7 @@ test("comments on sealed posts are disabled in this slice, and replies are never
 
     // A comment on a sealed post that bypassed the check is still not attached.
     await publishStory(validateInput({ body: "sneaky", authorId: "kinfolk-sam", inReplyTo: { fingerprint: fp("kinfolk-alex"), storyId: "story-alex-sealed" } }), { root },
-      { createdAt: "2026-09-29T13:05:00.000Z", storyId: "story-sam-c-sealed" });
+      { public: true, createdAt: "2026-09-29T13:05:00.000Z", storyId: "story-sam-c-sealed" });
     const alex = await view(root, "nextcloud-sim");
     assert.deepEqual(alex.stories.find((s) => s.id === "story-alex-sealed")?.comments, []);
     assert.ok(!alex.stories.some((s) => s.id === "story-sam-c-sealed"));
