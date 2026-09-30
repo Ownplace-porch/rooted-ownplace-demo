@@ -108,13 +108,57 @@ export interface DemoKinfolk {
   cloud: "kevcloud" | "google-drive";
 }
 
-export const DEMO_KINFOLK: readonly DemoKinfolk[] = [
-  { id: "kinfolk-alex", displayName: "Alex Rowan", bio: "Building a more rooted internet.", porch: "nextcloud-sim", cloud: "kevcloud" },
-  { id: "kinfolk-sam", displayName: "Sam", bio: "Keeping a porch on a different cloud.", porch: "google-drive-sim", cloud: "google-drive" },
-];
+export const DEFAULT_OPERATOR: DemoKinfolk = { id: "kinfolk-alex", displayName: "Alex Rowan", bio: "Building a more rooted internet.", porch: "nextcloud-sim", cloud: "kevcloud" };
+const SAM: DemoKinfolk = { id: "kinfolk-sam", displayName: "Sam", bio: "Keeping a porch on a different cloud.", porch: "google-drive-sim", cloud: "google-drive" };
+
+// M15 #111: each OwnPlace copy may name its own operator Kinfolk through
+// OWNPLACE_OPERATOR_ID / _NAME / _BIO. Only the operator's id, name and bio
+// change; the porch and cloud stay the operator's, and Sam is untouched.
+export const OPERATOR_NAME_MAX = 120;
+export const OPERATOR_BIO_MAX = 500;
+export const OPERATOR_SETTINGS_ERRORS = {
+  id: "OWNPLACE_OPERATOR_ID must be a valid Kinfolk id other than kinfolk-sam",
+  name: `OWNPLACE_OPERATOR_NAME must be 1 to ${OPERATOR_NAME_MAX} characters`,
+  bio: `OWNPLACE_OPERATOR_BIO must be ${OPERATOR_BIO_MAX} characters or fewer`,
+} as const;
+
+// Fixed messages only: the rejected value is never echoed back.
+export function resolveOperator(env: Record<string, string | undefined>): DemoKinfolk {
+  const { OWNPLACE_OPERATOR_ID: id, OWNPLACE_OPERATOR_NAME: name, OWNPLACE_OPERATOR_BIO: bio } = env;
+  if (id !== undefined && (!isSafeReaderId(id) || id === SAM.id)) throw new Error(OPERATOR_SETTINGS_ERRORS.id);
+  if (name !== undefined && (!name.trim() || name.trim().length > OPERATOR_NAME_MAX)) throw new Error(OPERATOR_SETTINGS_ERRORS.name);
+  if (bio !== undefined && bio.trim().length > OPERATOR_BIO_MAX) throw new Error(OPERATOR_SETTINGS_ERRORS.bio);
+  return {
+    ...DEFAULT_OPERATOR,
+    ...(id !== undefined && { id }),
+    ...(name !== undefined && { displayName: name.trim() }),
+    ...(bio !== undefined && { bio: bio.trim() }),
+  };
+}
+
+// Resolved once at load. Invalid settings keep the defaults here, but every
+// entry point calls requireOperatorSettings() first and refuses to start.
+let operatorSettingsError: string | undefined;
+function operatorFromEnv(): DemoKinfolk {
+  try {
+    return resolveOperator(process.env);
+  } catch (e) {
+    operatorSettingsError = (e as Error).message;
+    return DEFAULT_OPERATOR;
+  }
+}
+const OPERATOR = operatorFromEnv();
+
+export function requireOperatorSettings(): void {
+  if (operatorSettingsError === undefined) return;
+  console.error(`refusing to start: ${operatorSettingsError}`);
+  process.exit(2);
+}
+
+export const DEMO_KINFOLK: readonly DemoKinfolk[] = [OPERATOR, SAM];
 
 // The web operator (single write token) is this Kinfolk and posts only as them.
-export const OPERATOR_KINFOLK = "kinfolk-alex";
+export const OPERATOR_KINFOLK = OPERATOR.id;
 
 export const NO_PORCH = "author has no porch in this demo";
 

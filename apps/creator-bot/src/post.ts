@@ -15,6 +15,7 @@ import {
   NO_PORCH,
   OPERATOR_KINFOLK,
   publishStory,
+  requireOperatorSettings,
   validateInput,
   wallTargetFor,
 } from "@rooted/timeline";
@@ -27,13 +28,16 @@ function arg(name: string): string | undefined {
   return value;
 }
 
-const USAGE = 'usage: npm run post -- --title "TITLE" --body "BODY" [--author-id kinfolk-alex|kinfolk-sam] [--author-name NAME] [--reply-to STORY_ID | --wall CONTACT_ID] [--members-only] [--entitle-reader ID --reader-pubkey FILE] [--entitle-readers JSONFILE]';
+const USAGE = `usage: npm run post -- --title "TITLE" --body "BODY" [--author-id ${OPERATOR_KINFOLK}|kinfolk-sam] [--author-name NAME] [--reply-to STORY_ID | --wall CONTACT_ID] [--members-only] [--entitle-reader ID --reader-pubkey FILE] [--entitle-readers JSONFILE]`;
 
 function fail(message: string): never {
   console.error(`post failed: ${message}`);
   console.error(USAGE);
   process.exit(2);
 }
+
+// M15 #111: invalid OWNPLACE_OPERATOR_* settings refuse startup.
+requireOperatorSettings();
 
 function isSafeId(id: unknown): id is string {
   return typeof id === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id) && !id.includes("..");

@@ -663,3 +663,78 @@ test("reply writes need the operator login (#101)", async () => {
     await rm(tmp, { recursive: true, force: true });
   }
 });
+
+// M15 #111: each OwnPlace copy can set its own operator Kinfolk.
+const JORDAN = { OWNPLACE_OPERATOR_ID: "kinfolk-jordan", OWNPLACE_OPERATOR_NAME: "Jordan", OWNPLACE_OPERATOR_BIO: "Joined by QR code." };
+
+test("OWNPLACE_OPERATOR_* makes the web operator Jordan; posting as Alex is refused (#111)", async () => {
+  const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids, ...JORDAN });
+  try {
+    for (const body of [
+      { title: "t", body: "b", authorId: "kinfolk-alex" },
+      { title: "t", body: "b", authorId: "kinfolk-sam" },
+      { title: "t", body: "b", authorName: "Alex Rowan" },
+    ]) {
+      assertError(await client.request("POST", "/api/post", JSON.stringify(body)), 400, {
+        error: "can only post as the logged-in Kinfolk",
+      });
+    }
+    const posted = await client.request("POST", "/api/post", JSON.stringify({ title: "Hi", body: "as jordan", authorId: "kinfolk-jordan" }));
+    assert.equal(posted.status, 201);
+    const result = posted.json as { authorId: string; backends: string[]; storyId: string };
+    assert.equal(result.authorId, "kinfolk-jordan");
+    assert.deepEqual(result.backends, ["nextcloud-sim"], "the operator keeps their porch");
+
+    // Signed by Jordan's own key, with Jordan's name, on the operator's porch.
+    const jordanFp = identityFingerprint(loadOrCreateIdentity("kinfolk-jordan", ids).publicKey);
+    const timeline = await client.request("GET", "/api/timeline?backend=nextcloud-sim");
+    const entry = (timeline.json as { stories: { id: string; authorId: string; verified?: boolean; signer?: string }[] }).stories
+      .find((s) => s.id === result.storyId);
+    assert.equal(entry?.authorId, "kinfolk-jordan");
+    assert.equal(entry?.verified, true);
+    assert.equal(entry?.signer, jordanFp);
+    assert.equal((await client.request("GET", `/api/story?backend=nextcloud-sim&id=${result.storyId}`)).status, 200, "package verifies");
+    const kinfolk = await client.request("GET", `/porch/nextcloud-sim/timeline/${result.storyId}/kinfolk.json`);
+    assert.equal(kinfolk.status, 200);
+    const signed = kinfolk.json as { id: string; displayName: string };
+    assert.equal(signed.id, "kinfolk-jordan");
+    assert.equal(signed.displayName, "Jordan", "the signed package carries Jordan's name");
+
+    const invite = await client.request("GET", "/api/invite");
+    assert.equal(invite.status, 200);
+    assert.equal((invite.json as { displayName: string }).displayName, "Jordan");
+    assert.equal((invite.json as { fingerprint: string }).fingerprint, jordanFp);
+  } finally {
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+    await rm(ids, { recursive: true, force: true });
+  }
+});
+
+test("invalid OWNPLACE_OPERATOR_* refuses to start the server with a fixed message (#111)", async () => {
+  const cases: [Record<string, string>, string][] = [
+    [{ OWNPLACE_OPERATOR_ID: "../kinfolk" }, "OWNPLACE_OPERATOR_ID must be a valid Kinfolk id other than kinfolk-sam"],
+    [{ OWNPLACE_OPERATOR_ID: "kinfolk-sam" }, "OWNPLACE_OPERATOR_ID must be a valid Kinfolk id other than kinfolk-sam"],
+    [{ OWNPLACE_OPERATOR_NAME: "   " }, "OWNPLACE_OPERATOR_NAME must be 1 to 120 characters"],
+    [{ OWNPLACE_OPERATOR_BIO: "b".repeat(501) }, "OWNPLACE_OPERATOR_BIO must be 500 characters or fewer"],
+  ];
+  for (const [extraEnv, message] of cases) {
+    const child = spawn(process.execPath, ["--import", "tsx", serverEntry], {
+      cwd: repoRoot,
+      env: { ...process.env, PORT: "0", PUBLISH_ROOT: tmpdir(), ...extraEnv } as NodeJS.ProcessEnv,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    child.stdout!.on("data", (d) => (out += String(d)));
+    child.stderr!.on("data", (d) => (out += String(d)));
+    const code = await new Promise<number | null>((resolveExit) => {
+      const timer = setTimeout(() => { child.kill("SIGKILL"); resolveExit(null); }, 15000);
+      child.on("exit", (c) => { clearTimeout(timer); resolveExit(c); });
+    });
+    assert.equal(code, 2, `server must refuse to start: ${JSON.stringify(extraEnv)}`);
+    assert.ok(out.includes(`refusing to start: ${message}`), out);
+    assert.ok(!out.includes("http://127.0.0.1"), "server must not bind");
+    assert.ok(!/\n\s+at /.test(out) && !out.includes("Error"), "no stack trace");
+  }
+});

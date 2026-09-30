@@ -76,3 +76,25 @@ test("subscribe with a missing or unknown --author-id exits 2 and writes nothing
     await rm(tmp, { recursive: true, force: true });
   }
 });
+
+// M15 #111: on a copy whose operator is Jordan, Jordan owns the operator's
+// porch and Alex is not a Kinfolk there.
+test("subscribe allows the OWNPLACE_OPERATOR_* Kinfolk and refuses Alex (#111)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-subscribe-"));
+  const subscribe = (args: string[]) => run(process.execPath, ["--import", "tsx", subscribeEntry, ...args], {
+    cwd: repoRoot,
+    env: { ...process.env, PUBLISH_ROOT: tmp, OWNPLACE_OPERATOR_ID: "kinfolk-jordan" } as NodeJS.ProcessEnv,
+  });
+  try {
+    const pubkey = await readerPubkey(tmp);
+    await assert.rejects(
+      subscribe(["--author-id", "kinfolk-alex", "--reader-id", "reader-a", "--reader-pubkey", pubkey]),
+      (e: { code?: number; stderr?: string }) => e.code === 2 && /author has no porch in this demo/.test(e.stderr ?? ""),
+    );
+    await assert.rejects(access(join(tmp, "nextcloud-sim")), "a refused subscribe writes nothing");
+    const { stdout } = await subscribe(["--author-id", "kinfolk-jordan", "--reader-id", "reader-a", "--reader-pubkey", pubkey]);
+    assert.match(stdout, /subscribed reader-a to kinfolk-jordan on nextcloud-sim/);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});

@@ -18,18 +18,23 @@ import {
   backendsFromEnv,
   defaultRepoRoot,
   publishStory,
+  requireOperatorSettings,
   type DemoKinfolk,
 } from "@rooted/timeline";
 import { resolve } from "node:path";
 
-const SEED_STORIES: Record<string, { storyId: string; createdAt: string; title: string; body: string }> = {
-  "kinfolk-alex": {
+// M15 #111: invalid OWNPLACE_OPERATOR_* settings refuse startup. Seed
+// stories are keyed by porch, so a renamed operator still seeds their porch.
+requireOperatorSettings();
+
+const SEED_STORIES: Record<DemoKinfolk["porch"], { storyId: string; createdAt: string; title: string; body: string }> = {
+  "nextcloud-sim": {
     storyId: "story-first-light",
     createdAt: "2026-09-19T09:00:00.000Z",
     title: "First light at the workshop",
     body: "A small place can hold a big beginning. Today we opened the doors, shared a meal, and made room for one another.",
   },
-  "kinfolk-sam": {
+  "google-drive-sim": {
     storyId: "story-garden-table",
     createdAt: "2026-09-19T10:00:00.000Z",
     title: "A table in the garden",
@@ -42,7 +47,7 @@ const published: string[] = [];
 const skipped = new Set<string>();
 
 async function seed(kinfolk: DemoKinfolk): Promise<void> {
-  const story = SEED_STORIES[kinfolk.id];
+  const story = SEED_STORIES[kinfolk.porch];
   const res = await publishStory(
     { title: story.title, body: story.body, media: [], authorId: kinfolk.id, authorName: kinfolk.displayName, authorBio: kinfolk.bio },
     backends,
