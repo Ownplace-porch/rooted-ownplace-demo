@@ -32,7 +32,7 @@ async function withCreator(fn: (ctx: {
     await publishStory(
       { title: "Hello kin", body: "first post", authorId: "kinfolk-rowan", authorName: "Rowan" },
       { root: join(dir, "creator") },
-      { createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-rowan-1" },
+      { public: true, createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-rowan-1" },
     );
     const porchDir = join(dir, "creator/nextcloud-sim");
     const identity = await porchIdentity(new LocalFolderStore(porchDir));

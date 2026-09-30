@@ -83,7 +83,7 @@ test("public posts ignore the subscriber roster", async () => {
     await publishStory(
       { title: "Public", body: "everyone can read", authorId: "kinfolk-alex", authorName: "Alex" },
       { root },
-      { storyId: "story-public-sub" },
+      { public: true, storyId: "story-public-sub" },
     );
     const story = await readVerifiedHistoryStory(store, "story-public-sub");
     assert.equal(story.body, "everyone can read");

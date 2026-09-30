@@ -41,17 +41,17 @@ async function withPorches(fn: (dir: string) => Promise<void>) {
     await publishStory(
       { title: "Own", body: "mine", authorId: "kinfolk-me", authorName: "Me" },
       { root: dir },
-      { createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-own-1" },
+      { public: true, createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-own-1" },
     );
     await publishStory(
       { title: "Alex 1", body: "remote one", authorId: "kinfolk-alex", authorName: "Alex" },
       { root: join(dir, "remote-alex") },
-      { createdAt: "2026-09-28T00:01:00.000Z", storyId: "story-alex-1" },
+      { public: true, createdAt: "2026-09-28T00:01:00.000Z", storyId: "story-alex-1" },
     );
     await publishStory(
       { title: "Alex 2", body: "remote two", authorId: "kinfolk-alex", authorName: "Alex" },
       { root: join(dir, "remote-alex") },
-      { createdAt: "2026-09-28T00:02:00.000Z", storyId: "story-alex-2" },
+      { public: true, createdAt: "2026-09-28T00:02:00.000Z", storyId: "story-alex-2" },
     );
     await fn(dir);
   } finally {

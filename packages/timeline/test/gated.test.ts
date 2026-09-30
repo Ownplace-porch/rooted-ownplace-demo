@@ -512,7 +512,7 @@ test("m4 flat-copy: gated then public clears stale flat entitlements.json", asyn
     await publishStory(
       { title: "Public second", body: "everyone reads", authorId: "kinfolk-alex", authorName: "Alex" },
       { root },
-      { createdAt: "2026-09-20T00:00:01.000Z", storyId: publicId }
+      { public: true, createdAt: "2026-09-20T00:00:01.000Z", storyId: publicId }
     );
     for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));
@@ -565,12 +565,12 @@ test("m4 flat-copy: public then public stays absent", async () => {
     await publishStory(
       { title: "Free one", body: "hello", authorId: "kinfolk-alex", authorName: "Alex" },
       { root },
-      { createdAt: "2026-09-20T00:00:00.000Z", storyId: "story-flat-free-a" }
+      { public: true, createdAt: "2026-09-20T00:00:00.000Z", storyId: "story-flat-free-a" }
     );
     await publishStory(
       { title: "Free two", body: "world", authorId: "kinfolk-alex", authorName: "Alex" },
       { root },
-      { createdAt: "2026-09-20T00:00:01.000Z", storyId: "story-flat-free-b" }
+      { public: true, createdAt: "2026-09-20T00:00:01.000Z", storyId: "story-flat-free-b" }
     );
     for (const backend of ["nextcloud-sim"]) {
       const store = new LocalFolderStore(join(root, backend));

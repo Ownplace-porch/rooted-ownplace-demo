@@ -181,6 +181,85 @@ export function loadOrCreateEncryptionIdentity(
   return { privateKey, publicKey };
 }
 
+// One key wrap: the data key sealed to one reader's X25519 key with a
+// fresh ephemeral keypair. It names no reader. M16 #116: shared by sealed
+// bodies (below, which add a readerId) and author epoch keys (epoch.ts,
+// which must not).
+export interface KeyWrap {
+  ephemeralPublicKey: string;
+  keyNonce: string;
+  wrappedKey: string;
+}
+
+export function wrapDataKey(dataKey: Uint8Array, readerPublicKeyPem: string): KeyWrap {
+  if (dataKey.length !== DATA_KEY_BYTES) throw new Error("data key must be 32 bytes");
+  const readerPublic = loadX25519Public(readerPublicKeyPem, "reader public key");
+  const ephemeral = generateKeyPairSync("x25519");
+  const ephemeralPublic = ephemeral.publicKey;
+  const shared = diffieHellman({ privateKey: ephemeral.privateKey, publicKey: readerPublic });
+  const kek = deriveKek(shared, rawPublicBytes(ephemeralPublic), rawPublicBytes(readerPublic));
+  const keyNonce = randomBytes(KEY_NONCE_BYTES);
+  const keyCipher = createCipheriv(GATED_ALGORITHM, kek, keyNonce);
+  const wrappedKey = Buffer.concat([keyCipher.update(dataKey), keyCipher.final(), keyCipher.getAuthTag()]);
+  return {
+    ephemeralPublicKey: ephemeralPublic.export({ type: "spki", format: "pem" }).toString(),
+    keyNonce: toB64(keyNonce),
+    wrappedKey: toB64(wrappedKey),
+  };
+}
+
+function unwrapWithKey(wrap: KeyWrap, readerPrivate: KeyObject, readerRaw: Buffer): Buffer {
+  const ephemeralPublic = loadX25519Public(wrap.ephemeralPublicKey, "ephemeral key");
+  const shared = diffieHellman({ privateKey: readerPrivate, publicKey: ephemeralPublic });
+  const kek = deriveKek(shared, rawPublicBytes(ephemeralPublic), readerRaw);
+  const wrappedKey = fromB64(wrap.wrappedKey);
+  const keyDecipher = createDecipheriv(GATED_ALGORITHM, kek, fromB64(wrap.keyNonce, KEY_NONCE_BYTES));
+  keyDecipher.setAuthTag(wrappedKey.subarray(DATA_KEY_BYTES));
+  return Buffer.concat([
+    keyDecipher.update(wrappedKey.subarray(0, DATA_KEY_BYTES)),
+    keyDecipher.final(),
+  ]);
+}
+
+// Shape check for a wrap with no reader id; throws "gated envelope is
+// malformed" like the sealed-body parser.
+export function parseKeyWrap(value: unknown): KeyWrap {
+  if (!value || typeof value !== "object") throw new Error("gated envelope is malformed");
+  const wrap = value as Record<string, unknown>;
+  if (typeof wrap.ephemeralPublicKey !== "string" || wrap.ephemeralPublicKey.length === 0 || wrap.ephemeralPublicKey.length > MAX_B64_CHARS) {
+    throw new Error("gated envelope is malformed");
+  }
+  fromB64(wrap.keyNonce, KEY_NONCE_BYTES);
+  if (fromB64(wrap.wrappedKey).length !== DATA_KEY_BYTES + GCM_TAG_BYTES) throw new Error("gated envelope is malformed");
+  loadX25519Public(wrap.ephemeralPublicKey, "ephemeral key");
+  return { ephemeralPublicKey: wrap.ephemeralPublicKey, keyNonce: wrap.keyNonce as string, wrappedKey: wrap.wrappedKey as string };
+}
+
+// Trial-decrypts each wrap with the reader's key; returns the data key from
+// the first that opens, or undefined. Shape errors in a wrap skip it.
+export function unwrapDataKey(wraps: readonly KeyWrap[], readerPrivateKeyPem: string): Buffer | undefined {
+  const readerPrivate = loadX25519Private(readerPrivateKeyPem, "reader encryption key");
+  const readerRaw = rawPublicBytes(createPublicKey(readerPrivate));
+  for (const wrap of wraps) {
+    try {
+      return unwrapWithKey(wrap, readerPrivate, readerRaw);
+    } catch {
+      continue;
+    }
+  }
+  return undefined;
+}
+
+export function isEncryptionPublicKey(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_B64_CHARS) return false;
+  try {
+    loadX25519Public(value, "encryption key");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function sealBodyForReaders(
   plaintext: string,
   readers: SealReader[],
@@ -203,20 +282,7 @@ export function sealBodyForReaders(
   const wrapped: WrappedReaderKey[] = [];
   try {
     for (const r of readers) {
-      const readerPublic = loadX25519Public(r.readerPublicKey, "reader public key");
-      const ephemeral = generateKeyPairSync("x25519");
-      const ephemeralPublic = ephemeral.publicKey;
-      const shared = diffieHellman({ privateKey: ephemeral.privateKey, publicKey: readerPublic });
-      const kek = deriveKek(shared, rawPublicBytes(ephemeralPublic), rawPublicBytes(readerPublic));
-      const keyNonce = randomBytes(KEY_NONCE_BYTES);
-      const keyCipher = createCipheriv(GATED_ALGORITHM, kek, keyNonce);
-      const wrappedKey = Buffer.concat([keyCipher.update(dataKey), keyCipher.final(), keyCipher.getAuthTag()]);
-      wrapped.push({
-        readerId: r.readerId,
-        ephemeralPublicKey: ephemeralPublic.export({ type: "spki", format: "pem" }).toString(),
-        keyNonce: toB64(keyNonce),
-        wrappedKey: toB64(wrappedKey),
-      });
+      wrapped.push({ readerId: r.readerId, ...wrapDataKey(dataKey, r.readerPublicKey) });
     }
   } finally {
     dataKey.fill(0);
@@ -288,16 +354,7 @@ export function unsealBody(envelope: unknown, readerPrivateKeyPem: string, reade
   for (const entry of candidates) {
     let dataKey: Buffer | undefined;
     try {
-      const ephemeralPublic = loadX25519Public(entry.ephemeralPublicKey, "ephemeral key");
-      const shared = diffieHellman({ privateKey: readerPrivate, publicKey: ephemeralPublic });
-      const kek = deriveKek(shared, rawPublicBytes(ephemeralPublic), readerRaw);
-      const wrappedKey = fromB64(entry.wrappedKey);
-      const keyDecipher = createDecipheriv(GATED_ALGORITHM, kek, fromB64(entry.keyNonce, KEY_NONCE_BYTES));
-      keyDecipher.setAuthTag(wrappedKey.subarray(DATA_KEY_BYTES));
-      dataKey = Buffer.concat([
-        keyDecipher.update(wrappedKey.subarray(0, DATA_KEY_BYTES)),
-        keyDecipher.final(),
-      ]);
+      dataKey = unwrapWithKey(entry, readerPrivate, readerRaw);
       const bodyDecipher = createDecipheriv(GATED_ALGORITHM, dataKey, fromB64(env.bodyNonce, BODY_NONCE_BYTES));
       const ct = fromB64(env.ciphertext);
       bodyDecipher.setAuthTag(ct.subarray(ct.length - GCM_TAG_BYTES));

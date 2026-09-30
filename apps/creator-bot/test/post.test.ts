@@ -29,6 +29,7 @@ async function readJson(tmp: string, backend: string, ...parts: string[]) {
   return JSON.parse(await readFile(join(tmp, backend, ...parts), "utf8"));
 }
 
+// M16 #116: the default post is encrypted; its package names no title or body.
 test("post publishes the timeline story to Alex's porch only (#100)", async () => {
   const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
   try {
@@ -50,8 +51,7 @@ test("post publishes the timeline story to Alex's porch only (#100)", async () =
       }
     }
     const story = await readJson(tmp, "nextcloud-sim", "timeline", id, "story.json");
-    assert.equal(story.title, "Hello timeline");
-    assert.equal(story.body, "First syndicated post");
+    assert.deepEqual(Object.keys(story).sort(), ["authorId", "encrypted", "id"]);
     assert.equal(story.authorId, "kinfolk-alex");
   } finally {
     await rm(tmp, { recursive: true, force: true });
@@ -61,8 +61,8 @@ test("post publishes the timeline story to Alex's porch only (#100)", async () =
 test("post accumulates timeline across two posts", async () => {
   const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
   try {
-    await runPost(tmp, ["--title", "One", "--body", "first"]);
-    await runPost(tmp, ["--title", "Two", "--body", "second"]);
+    await runPost(tmp, ["--title", "One", "--body", "first", "--public"]);
+    await runPost(tmp, ["--title", "Two", "--body", "second", "--public"]);
     const index = await readJson(tmp, "nextcloud-sim", "timeline.json");
     assert.equal(index.stories.length, 2);
     assert.equal(index.stories[0].title, "Two"); // newest first
@@ -94,10 +94,11 @@ test("post rebuilds corrupt timeline index from on-disk history", async () => {
   const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
   const { writeFile } = await import("node:fs/promises");
   try {
-    await runPost(tmp, ["--title", "Keep me", "--body", "history survives"]);
+    await runPost(tmp, ["--title", "Keep me", "--body", "history survives", "--public"]);
     await writeFile(join(tmp, "nextcloud-sim", "timeline.json"), "{corrupt-index");
-    const { stdout } = await runPost(tmp, ["--title", "Second", "--body", "after corruption"]);
-    assert.match(stdout, /rebuilt nextcloud-sim index from 1 on-disk story/);
+    const { stdout } = await runPost(tmp, ["--title", "Second", "--body", "after corruption", "--public"]);
+    // M16 #116: the hint is rebuilt after the new package is written.
+    assert.match(stdout, /rebuilt nextcloud-sim index from 2 on-disk stories/);
     const index = JSON.parse(await readFile(join(tmp, "nextcloud-sim", "timeline.json"), "utf8"));
     assert.equal(index.stories.length, 2);
     const titles = index.stories.map((s: { title: string }) => s.title).sort();
@@ -327,6 +328,8 @@ test("post refuses unknown flags and stray arguments with usage and writes nothi
       [["--title", "t", "--body", "b", "--author-id=kinfolk-sam"], /post failed: unknown flag: --author-id=kinfolk-sam\n/],
       [["--title", "t", "--body", "b", "--members-only", "--members"], /post failed: unknown flag: --members\n/],
       [["--title", "t", "--body", "two", "words"], /post failed: unexpected argument: words\n/],
+      // --public is a boolean flag: it must not swallow a stray argument.
+      [["--title", "t", "--body", "b", "--public", "extra"], /post failed: unexpected argument: extra\n/],
     ];
     for (const [args, message] of cases) {
       await assert.rejects(runPost(tmp, args, env),
@@ -337,6 +340,33 @@ test("post refuses unknown flags and stray arguments with usage and writes nothi
     // Every documented flag is still accepted.
     const { stdout } = await runPost(tmp, ["--title", "t", "--body", "b", "--author-id", "kinfolk-alex", "--author-name", "Alex", "--members-only"], env);
     assert.match(stdout, /done: nextcloud-sim .*author=kinfolk-alex/);
+    // M16 #116's --public is accepted and still writes the plaintext format.
+    const pub = await runPost(tmp, ["--public", "--title", "Open", "--body", "for everyone"], env);
+    const id = (pub.stdout.match(/story=\S+/) ?? [""])[0].replace("story=", "").trim();
+    const story = await readJson(tmp, "nextcloud-sim", "timeline", id, "story.json");
+    assert.equal(story.body, "for everyone");
+    assert.equal(story.encrypted, undefined);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
+// M16 #116: --public writes today's signed plaintext format; it cannot be
+// combined with paid gating.
+test("post --public writes the signed plaintext format", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
+  try {
+    const { stdout } = await runPost(tmp, ["--title", "Teaser", "--body", "Watch the video", "--public"]);
+    const id = (stdout.match(/story=\S+/) ?? [""])[0].replace("story=", "").trim();
+    assert.match(id, /^story-[0-9a-f]{32}$/);
+    const story = await readJson(tmp, "nextcloud-sim", "timeline", id, "story.json");
+    assert.equal(story.title, "Teaser");
+    assert.equal(story.body, "Watch the video");
+    assert.equal(story.encrypted, undefined);
+    const index = await readJson(tmp, "nextcloud-sim", "timeline.json");
+    assert.deepEqual(index.stories.map((s: { id: string; title: string }) => [s.id, s.title]), [[id, "Teaser"]]);
+    await assert.rejects(runPost(tmp, ["--title", "T", "--body", "B", "--public", "--members-only"]),
+      (e: { code?: number; stderr?: string }) => e.code === 2 && /--public cannot be combined with paid-gating flags/.test(e.stderr ?? ""));
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }

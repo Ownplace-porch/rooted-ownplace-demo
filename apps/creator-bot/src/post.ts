@@ -4,6 +4,8 @@
 // {readerId, pubkeyFile} or {readerId, publicKey}); combines with the legacy single-reader flags.
 // M15 #101: --reply-to STORY_ID comments on a post the author can see; --wall CONTACT_ID
 // writes on a followed Kinfolk's wall. Both publish to the author's own porch, public only.
+// M16 #116: posts are encrypted to the author and their mutual follows by default; --public
+// writes the signed plaintext format instead.
 
 import { readFileSync } from "node:fs";
 import {
@@ -14,6 +16,7 @@ import {
   demoKinfolkFor,
   NO_PORCH,
   OPERATOR_KINFOLK,
+  porchReaderKey,
   publishStory,
   requireOperatorSettings,
   validateInput,
@@ -28,7 +31,7 @@ function arg(name: string): string | undefined {
   return value;
 }
 
-const USAGE = `usage: npm run post -- --title "TITLE" --body "BODY" [--author-id ${OPERATOR_KINFOLK}|kinfolk-sam] [--author-name NAME] [--reply-to STORY_ID | --wall CONTACT_ID] [--members-only] [--entitle-reader ID --reader-pubkey FILE] [--entitle-readers JSONFILE]`;
+const USAGE = `usage: npm run post -- --title "TITLE" --body "BODY" [--author-id ${OPERATOR_KINFOLK}|kinfolk-sam] [--author-name NAME] [--reply-to STORY_ID | --wall CONTACT_ID] [--public] [--members-only] [--entitle-reader ID --reader-pubkey FILE] [--entitle-readers JSONFILE]`;
 
 function fail(message: string): never {
   console.error(`post failed: ${message}`);
@@ -39,7 +42,7 @@ function fail(message: string): never {
 // M15 #113: refuse unknown flags and stray arguments before anything is read
 // or signed, so a typo like --author can't silently post as the operator.
 const VALUE_FLAGS = new Set(["title", "body", "author-id", "author-name", "reply-to", "wall", "entitle-reader", "reader-pubkey", "entitle-readers"]);
-const BOOLEAN_FLAGS = new Set(["members-only"]);
+const BOOLEAN_FLAGS = new Set(["members-only", "public"]);
 
 function checkArgs(argv: string[]): void {
   for (let i = 0; i < argv.length; i++) {
@@ -74,11 +77,13 @@ let target: { to?: Awaited<ReturnType<typeof wallTargetFor>>; inReplyTo?: Awaite
 if (replyTo !== undefined || wall !== undefined) {
   const author = demoKinfolkFor((arg("author-id") ?? OPERATOR_KINFOLK).trim());
   if (!author) fail(NO_PORCH);
+  // M16 #116: the author reads their own view, so encrypted posts count.
+  const readerKey = porchReaderKey(author.porch);
   try {
     target = replyTo !== undefined
-      ? { inReplyTo: await commentTargetFor(backends.root, author.porch, replyTo) }
+      ? { inReplyTo: await commentTargetFor(backends.root, author.porch, replyTo, { readerKey }) }
       : { to: await wallTargetFor(backends.root, author.porch, wall!) };
-    await checkReplyTarget(backends.root, author.porch, target);
+    await checkReplyTarget(backends.root, author.porch, target, { readerKey });
   } catch (e) {
     fail((e as Error).message);
   }
@@ -172,6 +177,8 @@ if (entitleReadersFile !== undefined) {
   entitleReaders = batch;
 }
 const membersOnly = process.argv.includes("--members-only");
+const isPublic = process.argv.includes("--public");
 if ((validated.to || validated.inReplyTo) && (membersOnly || entitle || entitleReaders)) fail("comments and wall posts are public in this slice");
-const res = await publishStory(validated, backends, { entitle, entitleReaders, membersOnly });
+if (isPublic && (membersOnly || entitle || entitleReaders)) fail("--public cannot be combined with paid-gating flags");
+const res = await publishStory(validated, backends, { entitle, entitleReaders, membersOnly, public: isPublic });
 console.log(`done: ${res.backends.join(", ")} story=${res.storyId} author=${res.authorId}`);

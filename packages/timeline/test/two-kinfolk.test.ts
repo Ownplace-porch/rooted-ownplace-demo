@@ -45,7 +45,7 @@ test("Sam's post lands on Sam's porch only and is signed as Sam", async () => {
     const res = await publishStory(
       validateInput({ title: "Sam post", body: "from the drive porch", authorId: "kinfolk-sam" }),
       { root },
-      { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-sam-only" },
+      { public: true, createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-sam-only" },
     );
     assert.deepEqual(res.backends, ["google-drive-sim"]);
     await assert.rejects(access(join(root, "nextcloud-sim")), "Sam's post must not reach Alex's porch");
@@ -68,14 +68,14 @@ test("each Kinfolk syncs only to their own real cloud", async () => {
     const sam = await publishStory(
       { title: "Sam", body: "b", authorId: "kinfolk-sam", authorName: "Sam" },
       { ...clouds, drive: undefined },
-      { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-sam-cloud" },
+      { public: true, createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-sam-cloud" },
     );
     assert.deepEqual(sam.backends, ["google-drive-sim"]);
     assert.ok(sam.skipped.includes("kevcloud"), "Sam never syncs to Alex's Nextcloud");
     const alex = await publishStory(
       { title: "Alex", body: "b", authorId: "kinfolk-alex", authorName: "Alex Rowan" },
       { ...clouds, kevcloud: undefined },
-      { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-alex-cloud" },
+      { public: true, createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-alex-cloud" },
     );
     assert.deepEqual(alex.backends, ["nextcloud-sim"]);
     assert.ok(alex.skipped.includes("google-drive"), "Alex never syncs to Sam's Google Drive");

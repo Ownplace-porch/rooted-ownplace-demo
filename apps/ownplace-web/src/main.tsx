@@ -9,6 +9,8 @@ type TimelineEntry = {
   id: string; title: string; authorId: string; createdAt: string; verified?: boolean; origin?: string;
   signer?: string; to?: { fingerprint: string }; inReplyTo?: { fingerprint: string; storyId: string };
   sealed?: true; comments?: TimelineEntry[];
+  // M16 #116: decrypted by the server for a logged-in reader.
+  encrypted?: true;
 };
 type Timeline = { owner?: string; stories: TimelineEntry[] };
 type Story = { id: string; title: string; body: string; createdAt: string; authorId: string; restricted?: unknown };
@@ -134,6 +136,8 @@ function useBackend(backend: string, refresh: number) {
 function Composer({ onPosted }: { onPosted: () => void }) {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
+  // M16 #116: posts are encrypted to Alex's Kinfolk unless this is ticked.
+  const [isPublic, setIsPublic] = useState(false);
   const [status, setStatus] = useState<string>("");
   const [busy, setBusy] = useState(false);
   async function submit(e: React.FormEvent) {
@@ -145,7 +149,7 @@ function Composer({ onPosted }: { onPosted: () => void }) {
       const res = await fetch("/api/post", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, body }),
+        body: JSON.stringify({ title, body, public: isPublic }),
       });
       const parsed = (await safeJson(res)) as { storyId?: string; error?: string } | null;
       if (!res.ok) {
@@ -154,6 +158,7 @@ function Composer({ onPosted }: { onPosted: () => void }) {
         setStatus(`Posted ${parsed?.storyId ?? ""} to ${OPERATOR.kinfolk}'s porch on ${OPERATOR.cloud}.`);
         setTitle("");
         setBody("");
+        setIsPublic(false);
         onPosted();
       }
     } catch (err) {
@@ -165,7 +170,7 @@ function Composer({ onPosted }: { onPosted: () => void }) {
   return (
     <section className="composer">
       <h2>New post</h2>
-      <p className="lede">Posting as {OPERATOR.kinfolk} · {OPERATOR.cloud}. Kinfolk who follow {OPERATOR.kinfolk} see it on their porch.</p>
+      <p className="lede">Posting as {OPERATOR.kinfolk} · {OPERATOR.cloud}. Posts are encrypted: only {OPERATOR.kinfolk} and Kinfolk who follow each other with {OPERATOR.kinfolk} can read them.</p>
       <form onSubmit={submit}>
         <input
           value={title}
@@ -182,6 +187,9 @@ function Composer({ onPosted }: { onPosted: () => void }) {
           rows={4}
           aria-label="Body"
         />
+        <label className="toggle">
+          <input type="checkbox" checked={isPublic} onChange={(e) => setIsPublic(e.target.checked)} /> Public post (anyone with the porch link can read it)
+        </label>
         <button type="submit" disabled={busy || !title.trim() || !body.trim()}>
           {busy ? "Posting…" : "Post to timeline"}
         </button>
@@ -638,7 +646,7 @@ function BackendColumn({ backend, kinfolk, cloud, refresh, authed, operatorFp, o
             const ownerPost = state.owner !== undefined && e.signer === state.owner;
             return (
               <div key={e.id} className="story">
-                <p className="date">{formatDate(e.createdAt)} · verified signature{from ? ` · ${from}` : ""}</p>
+                <p className="date">{formatDate(e.createdAt)} · verified signature{e.encrypted ? " · encrypted" : ""}{from ? ` · ${from}` : ""}</p>
                 {!e.to && <h3>{e.title}</h3>}
                 {s ? (s.restricted !== undefined ? <Unlocker backend={backend} id={e.id} /> : <p>{s.body}</p>) : <p>Story unavailable or failed verification for this entry.</p>}
                 {e.to && <ReplyActions entry={e} canDelete={mine(e)} canHide={hideable(e, true)} onDone={onChanged} />}
@@ -777,7 +785,7 @@ function App() {
         <span>
           Timelines show only Ed25519-verified history packages — content hashes
           and signatures are checked before display. Unverified entries are
-          hidden, never shown. Content is not encrypted.
+          hidden, never shown. Posts are encrypted to the author and mutual follows unless marked public (demo-grade crypto, not audited).
         </span>
       </section>
       {authed === null && <p>Checking login…</p>}
