@@ -7,7 +7,8 @@ import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import { identityFingerprint, loadOrCreateIdentity } from "@rooted/protocol";
-import { buildPackage, publishStory, readContactFollowedTimeline, validateContact, addContact } from "@rooted/timeline";
+import { buildPackage, publishStory, readContactFollowedTimeline, validateContact, addContact, ENCRYPTED_POST } from "@rooted/timeline";
+import { loadOrCreateEncryptionIdentity } from "@rooted/protocol";
 import { LocalFolderStore } from "@rooted/storage";
 import http from "node:http";
 
@@ -15,7 +16,7 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const serverEntry = resolve(repoRoot, "apps/ownplace-web/src/server.ts");
 
 interface Client {
-  request(method: string, path: string, rawBody?: string): Promise<{ status: number; json: unknown; raw: string }>;
+  request(method: string, path: string, rawBody?: string, headers?: Record<string, string>): Promise<{ status: number; json: unknown; raw: string }>;
   close(): void;
 }
 
@@ -89,8 +90,8 @@ async function boot(extraEnv: Record<string, string> = {}): Promise<{ child: Chi
     child,
     tmp,
     client: {
-      request: async (method, path, rawBody) => {
-        const r = await request(method, path, rawBody);
+      request: async (method, path, rawBody, headers) => {
+        const r = await request(method, path, rawBody, headers);
         return { status: r.status, json: r.json, raw: r.raw };
       },
       close: () => child.kill("SIGKILL"),
@@ -293,17 +294,17 @@ test("web timeline merges local followed porches and isolates tamper (#76)", asy
     await publishStory(
       { title: "Own", body: "mine", authorId: "kinfolk-me", authorName: "Me" },
       { root: tmp },
-      { createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-own-1" },
+      { public: true, createdAt: "2026-09-24T00:00:00.000Z", storyId: "story-own-1" },
     );
     await publishStory(
       { title: "Alex", body: "from alex", authorId: "kinfolk-alex", authorName: "Alex" },
       { root: join(tmp, "porch-alex") },
-      { createdAt: "2026-09-24T00:02:00.000Z", storyId: "story-alex-1" },
+      { public: true, createdAt: "2026-09-24T00:02:00.000Z", storyId: "story-alex-1" },
     );
     await publishStory(
       { title: "Sam", body: "from sam", authorId: "kinfolk-sam", authorName: "Sam" },
       { root: join(tmp, "porch-sam") },
-      { createdAt: "2026-09-24T00:01:00.000Z", storyId: "story-sam-1" },
+      { public: true, createdAt: "2026-09-24T00:01:00.000Z", storyId: "story-sam-1" },
     );
     assert.equal((await client.request("POST", "/api/contacts", JSON.stringify({
       id: "porch-alex", displayName: "Alex", address: "local:porch-alex/nextcloud-sim",
@@ -397,7 +398,7 @@ test("public porch route serves only package files and round-trips to a follower
     await publishStory(
       { title: "Served", body: "over the porch route", authorId: "kinfolk-me", authorName: "Me" },
       { root: tmp },
-      { createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-served-1" },
+      { public: true, createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-served-1" },
     );
     assert.equal((await client.request("POST", "/api/contacts", JSON.stringify({
       id: "porch-alex", displayName: "Alex", address: "local:porch-alex/nextcloud-sim",
@@ -452,7 +453,7 @@ test("invite routes are public-safe and follow-by-invite fails closed (#92)", as
     await publishStory(
       { title: "Hi", body: "invite me", authorId: "kinfolk-rowan", authorName: "Rowan" },
       { root: tmp },
-      { createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-invite-1" },
+      { public: true, createdAt: "2026-09-28T00:00:00.000Z", storyId: "story-invite-1" },
     );
     const info = await client.request("GET", "/api/invite?backend=nextcloud-sim");
     assert.equal(info.status, 200);
@@ -506,7 +507,7 @@ test("/api/invite with no backend shows only the operator's invite; /i/ serves b
     await publishStory(
       { title: "Hi", body: "sam's porch", authorId: "kinfolk-sam", authorName: "Sam" },
       { root: tmp },
-      { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-invite-97" },
+      { public: true, createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-invite-97" },
     );
     assert.equal((await client.request("GET", "/api/invite")).status, 404, "panel never shows the other Kinfolk's invite");
     const sam = await client.request("GET", "/api/invite?backend=google-drive-sim");
@@ -526,7 +527,7 @@ test("/api/invite with no backend shows only the operator's invite; /i/ serves b
     await publishStory(
       { title: "Hi", body: "alex's porch", authorId: "kinfolk-alex", authorName: "Alex Rowan" },
       { root: tmp },
-      { createdAt: "2026-09-29T00:01:00.000Z", storyId: "story-invite-97-alex" },
+      { public: true, createdAt: "2026-09-29T00:01:00.000Z", storyId: "story-invite-97-alex" },
     );
     const info = await client.request("GET", "/api/invite");
     assert.equal(info.status, 200);
@@ -583,9 +584,9 @@ test("web comments, wall posts, delete and hide between Alex and Sam (#101)", as
   try {
     const fp = (id: string) => identityFingerprint(loadOrCreateIdentity(id).publicKey);
     await publishStory({ title: "Alex post", body: "from alex", authorId: "kinfolk-alex", authorName: "Alex Rowan" }, { root: tmp },
-      { createdAt: "2026-09-29T09:00:00.000Z", storyId: "story-alex-1" });
+      { public: true, createdAt: "2026-09-29T09:00:00.000Z", storyId: "story-alex-1" });
     await publishStory({ title: "Sam post", body: "from sam", authorId: "kinfolk-sam", authorName: "Sam" }, { root: tmp },
-      { createdAt: "2026-09-29T10:00:00.000Z", storyId: "story-sam-1" });
+      { public: true, createdAt: "2026-09-29T10:00:00.000Z", storyId: "story-sam-1" });
     await addContact(new LocalFolderStore(join(tmp, "nextcloud-sim")), {
       id: "kinfolk-sam", displayName: "Sam", addedAt: "2026-09-29T00:00:00.000Z", address: "local:google-drive-sim", fingerprint: fp("kinfolk-sam"),
     });
@@ -625,7 +626,7 @@ test("web comments, wall posts, delete and hide between Alex and Sam (#101)", as
 
     // Sam comments on Alex's post (Sam's porch); Alex hides it locally.
     await publishStory({ title: "Comment", body: "from sam", authorId: "kinfolk-sam", authorName: "Sam", inReplyTo: { fingerprint: fp("kinfolk-alex"), storyId: "story-alex-1" } },
-      { root: tmp }, { createdAt: "2026-09-29T11:00:00.000Z", storyId: "story-sam-c1" });
+      { root: tmp }, { public: true, createdAt: "2026-09-29T11:00:00.000Z", storyId: "story-sam-c1" });
     assert.deepEqual((await timeline("nextcloud-sim")).stories.find((s) => s.id === "story-alex-1")?.comments?.map((c) => c.id), ["story-sam-c1"]);
     assertError(await client.request("POST", "/api/hidden", JSON.stringify({ fingerprint: fp("kinfolk-alex"), storyId: commentId })), 404, { error: "not found" });
     assertError(await client.request("POST", "/api/hidden", JSON.stringify({ fingerprint: "x", storyId: "story-sam-c1" })), 400, { error: "bad reply" });
@@ -736,5 +737,82 @@ test("invalid OWNPLACE_OPERATOR_* refuses to start the server with a fixed messa
     assert.ok(out.includes(`refusing to start: ${message}`), out);
     assert.ok(!out.includes("http://127.0.0.1"), "server must not bind");
     assert.ok(!/\n\s+at /.test(out) && !out.includes("Error"), "no stack trace");
+  }
+});
+
+// M16 #116: posts are encrypted by default. The porch serves only ciphertext
+// and key wraps; the web API opens them only for a logged-in request.
+test("encrypted posts: porch serves ciphertext and keys.json, only a logged-in read opens them (#116)", async () => {
+  const ids = await mkdtemp(resolve(tmpdir(), "rooted-web-ids-"));
+  const { client, tmp } = await boot({ OWNPLACE_IDENTITY_DIR: ids, OWNPLACE_WRITE_TOKEN: "t" });
+  const savedIds = process.env.OWNPLACE_IDENTITY_DIR;
+  process.env.OWNPLACE_IDENTITY_DIR = ids;
+  const follower = await mkdtemp(resolve(tmpdir(), "rooted-follower-"));
+  const auth = { authorization: "Bearer t" };
+  try {
+    const fp = (id: string) => identityFingerprint(loadOrCreateIdentity(id).publicKey);
+    await addContact(new LocalFolderStore(join(tmp, "nextcloud-sim")), {
+      id: "kinfolk-sam", displayName: "Sam", addedAt: "2026-09-29T00:00:00.000Z", address: "local:google-drive-sim", fingerprint: fp("kinfolk-sam"),
+    });
+    await addContact(new LocalFolderStore(join(tmp, "google-drive-sim")), {
+      id: "kinfolk-alex", displayName: "Alex Rowan", addedAt: "2026-09-29T00:00:00.000Z", address: "local:nextcloud-sim", fingerprint: fp("kinfolk-alex"),
+    });
+    await publishStory({ title: "Sam post", body: "from sam", authorId: "kinfolk-sam", authorName: "Sam" }, { root: tmp }, { storyId: "story-sam-1" });
+    const post = (body: unknown) => client.request("POST", "/api/post", JSON.stringify(body), auth);
+    const secret = await post({ title: "Harvest plans", body: "Meet at the barn at dawn" });
+    assert.equal(secret.status, 201);
+    const secretId = (secret.json as { storyId: string }).storyId;
+    const teaser = await post({ title: "Teaser", body: "Out soon", public: true });
+    assert.equal(teaser.status, 201);
+    const teaserId = (teaser.json as { storyId: string }).storyId;
+    assertError(await post({ title: "x", body: "y", public: "yes" }), 400, { error: "public must be true or false" });
+
+    // The porch: ciphertext, signatures and id-free key wraps.
+    const raw = await client.request("GET", `/porch/nextcloud-sim/timeline/${secretId}/story.json`);
+    assert.equal(raw.status, 200);
+    assert.ok(!raw.raw.includes("Harvest") && !raw.raw.includes("barn"));
+    const keys = await client.request("GET", "/porch/nextcloud-sim/keys.json");
+    assert.equal(keys.status, 200);
+    assert.ok(!keys.raw.includes("kinfolk-") && !keys.raw.includes(fp("kinfolk-sam")));
+
+    // Not logged in: the stranger's view.
+    const anon = await client.request("GET", "/api/timeline?backend=nextcloud-sim");
+    assert.deepEqual((anon.json as { stories: { id: string }[] }).stories.map((s) => s.id), [teaserId]);
+    assert.ok((anon.json as { skipped: { id: string; reason: string }[] }).skipped.some((s) => s.id === secretId && s.reason === ENCRYPTED_POST));
+    assert.ok(!anon.raw.includes("Harvest"));
+    assert.equal((await client.request("GET", `/api/story?backend=nextcloud-sim&id=${secretId}`)).status, 404);
+    assert.equal((await client.request("POST", "/api/open", JSON.stringify({ id: secretId }))).status, 404);
+
+    // Logged in: each column is read as its owner.
+    const alex = await client.request("GET", "/api/timeline?backend=nextcloud-sim", undefined, auth);
+    const alexStories = (alex.json as { stories: { id: string; title: string; encrypted?: boolean }[] }).stories;
+    assert.equal(alexStories.find((s) => s.id === secretId)?.title, "Harvest plans");
+    assert.equal(alexStories.find((s) => s.id === secretId)?.encrypted, true);
+    assert.equal(((await client.request("GET", `/api/story?backend=nextcloud-sim&id=${secretId}`, undefined, auth)).json as { body: string }).body, "Meet at the barn at dawn");
+    const sam = await client.request("GET", "/api/timeline?backend=google-drive-sim", undefined, auth);
+    assert.ok((sam.json as { stories: { id: string }[] }).stories.some((s) => s.id === secretId), "Sam, a mutual follow, reads it");
+
+    // A second instance follows the porch over https: Sam's key opens it, a stranger's does not.
+    await addContact(new LocalFolderStore(join(follower, "google-drive-sim")), validateContact({
+      id: "alex-remote", displayName: "Alex", address: "https://porch.test/porch/nextcloud-sim",
+    }));
+    const viaRoute = async (url: string): Promise<Response> => {
+      const r = await client.request("GET", url.replace("https://porch.test", ""));
+      return new Response(r.raw, { status: r.status });
+    };
+    const asSam = await readContactFollowedTimeline(follower, "google-drive-sim", "2026-09-30T00:00:00.000Z", "google-drive-sim",
+      { fetch: viaRoute, readerKey: loadOrCreateEncryptionIdentity("kinfolk-sam").privateKey });
+    assert.deepEqual(asSam.stories.map((s) => s.id).sort(), [secretId, teaserId].sort());
+    const asStranger = await readContactFollowedTimeline(follower, "google-drive-sim", "2026-09-30T00:00:00.000Z", "google-drive-sim",
+      { fetch: viaRoute, readerKey: loadOrCreateEncryptionIdentity("kinfolk-stranger").privateKey });
+    assert.deepEqual(asStranger.stories.map((s) => s.id), [teaserId]);
+    assert.ok(asStranger.skipped.some((s) => s.id === secretId && s.reason === ENCRYPTED_POST));
+  } finally {
+    if (savedIds === undefined) delete process.env.OWNPLACE_IDENTITY_DIR;
+    else process.env.OWNPLACE_IDENTITY_DIR = savedIds;
+    client.close();
+    await rm(tmp, { recursive: true, force: true });
+    await rm(ids, { recursive: true, force: true });
+    await rm(follower, { recursive: true, force: true });
   }
 });

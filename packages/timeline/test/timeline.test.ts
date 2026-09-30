@@ -48,7 +48,7 @@ test("publishStory writes the author's porch only (#100)", async () => {
   const tmp = await mk(join(tmpdir(), "rooted-lib-"));
   try {
     const validated = validateInput({ title: "Lib post", body: "via shared lib" });
-    const res = await publishStory(validated, { root: tmp }, {
+    const res = await publishStory(validated, { root: tmp }, { public: true,
       createdAt: "2026-09-20T00:00:00.000Z",
       storyId: "story-2026-09-20-libtest1",
     });
@@ -121,7 +121,7 @@ async function publishOne(tmp: string, title = "Real title") {
   process.env.OWNPLACE_IDENTITY_DIR = idDir;
   try {
     const validated = validateInput({ title, body: "body" });
-    const res = await publishStory(validated, { root: tmp }, {
+    const res = await publishStory(validated, { root: tmp }, { public: true,
       createdAt: "2026-09-20T00:00:00.000Z",
       storyId: `story-2026-09-20-${Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0")}`,
     });

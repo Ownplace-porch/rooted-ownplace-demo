@@ -34,7 +34,7 @@ async function setup() {
   await publishStory(
     { title: "Rowan 1", body: "by rowan", authorId: "kinfolk-rowan", authorName: "Rowan" },
     { root: join(dir, "creator") },
-    { createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-rowan-1" },
+    { public: true, createdAt: "2026-09-29T00:00:00.000Z", storyId: "story-rowan-1" },
   );
   await copyToSecondPorch(dir);
   const identity = (await porchIdentity(new LocalFolderStore(join(dir, "creator/nextcloud-sim"))))!;
@@ -93,7 +93,7 @@ test("pin: a post signed by another key on the followed porch is hidden", async 
     await publishStory(
       { title: "Squatter", body: "not rowan", authorId: "kinfolk-squat", authorName: "Rowan" },
       { root: join(t.dir, "creator") },
-      { createdAt: "2026-09-29T00:30:00.000Z", storyId: "story-squat-1" },
+      { public: true, createdAt: "2026-09-29T00:30:00.000Z", storyId: "story-squat-1" },
     );
     await copyToSecondPorch(t.dir);
     const merged = await t.read();
@@ -144,7 +144,7 @@ test("move: invite pointing at a porch the pinned key never signed is not follow
     await publishStory(
       { title: "Stranger", body: "other creator", authorId: "kinfolk-stranger", authorName: "Rowan" },
       { root: join(t.dir, "stranger") },
-      { createdAt: "2026-09-29T00:40:00.000Z", storyId: "story-stranger-1" },
+      { public: true, createdAt: "2026-09-29T00:40:00.000Z", storyId: "story-stranger-1" },
     );
     t.state.porch = "stranger-sim";
     t.state.served = new Set(["stranger-sim"]);
@@ -165,7 +165,7 @@ test("move: a pinned porch now full of another key's posts re-resolves", async (
     await publishStory(
       { title: "Stranger", body: "took the old path", authorId: "kinfolk-stranger", authorName: "X" },
       { root: join(t.dir, "stranger") },
-      { createdAt: "2026-09-29T00:40:00.000Z", storyId: "story-stranger-1" },
+      { public: true, createdAt: "2026-09-29T00:40:00.000Z", storyId: "story-stranger-1" },
     );
     t.state.folders["nextcloud-sim"] = join(t.dir, "stranger/nextcloud-sim");
     t.state.porch = "google-drive-sim";
@@ -183,7 +183,7 @@ test("move: a stored invite that names another creator never re-points the pin",
     await publishStory(
       { title: "Stranger", body: "other creator", authorId: "kinfolk-stranger", authorName: "Stranger" },
       { root: join(t.dir, "stranger") },
-      { createdAt: "2026-09-29T00:40:00.000Z", storyId: "story-stranger-1" },
+      { public: true, createdAt: "2026-09-29T00:40:00.000Z", storyId: "story-stranger-1" },
     );
     const stranger = (await porchIdentity(new LocalFolderStore(join(t.dir, "stranger/nextcloud-sim"))))!;
     // contacts.json edited so Rowan's pinned contact carries the stranger's invite.

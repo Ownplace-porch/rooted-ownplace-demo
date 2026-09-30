@@ -9,7 +9,8 @@
 //   GET  /api/story?backend=B&id=ID                 verified history story
 //   POST /api/open  {backend?, id, readerKey, readerId?}  open sealed body+media
 //   GET  /api/contacts?backend=B                    that porch's contact list
-//   POST /api/post        {title, body}  (as the operator Kinfolk only)
+//   POST /api/post        {title, body, public?}  (as the operator Kinfolk only;
+//                                                   M16 #116: encrypted unless public: true)
 //   POST /api/post        {body, inReplyTo: {fingerprint, storyId}} | {body, to: {fingerprint}}
 //   DELETE /api/post?id=ID                          operator deletes own comment/wall post
 //   POST /api/hidden      {fingerprint, storyId}    operator hides a reply aimed at them
@@ -21,6 +22,8 @@
 // Bearer tokens are also accepted. POST/DELETE get 401 without auth;
 // reads stay public. When the env var is unset, writes are allowed locally
 // with a console warning (dev convenience, not a claim).
+// M16 #116: reads decrypt encrypted posts only for an authenticated request;
+// anyone else gets the stranger's view, where encrypted posts are left out.
 
 import { randomBytes } from "node:crypto";
 import http from "node:http";
@@ -42,6 +45,7 @@ import {
   isSafeHistoryId,
   OPERATOR_KINFOLK,
   isSafeReaderId,
+  porchReaderKey,
   requireOperatorSettings,
   publishStory,
   readVerifiedFollowedStory,
@@ -199,6 +203,12 @@ function authorized(req: http.IncomingMessage): boolean {
   return isAuthenticated(req);
 }
 
+// M16 #116: each column is read as its porch's owner, with that owner's
+// X25519 key from this machine, and only for an authenticated request.
+function readerKeyFor(req: http.IncomingMessage, backend: string): string | undefined {
+  return isAuthenticated(req) ? porchReaderKey(backend) : undefined;
+}
+
 const MIME: Record<string, string> = {
   ".html": "text/html",
   ".js": "text/javascript",
@@ -228,7 +238,7 @@ const server = http.createServer(async (req, res) => {
         // posts are attached to their targets; `owner` is the porch owner's
         // key fingerprint (from verified posts) when there is exactly one.
         const now = new Date().toISOString();
-        const merged = await readThreadedTimeline(storesRoot, backend, now, backend);
+        const merged = await readThreadedTimeline(storesRoot, backend, now, backend, { readerKey: readerKeyFor(req, backend) });
         send(res, 200, {
           protocol: "rooted/v0.1",
           kind: "timeline",
@@ -256,7 +266,7 @@ const server = http.createServer(async (req, res) => {
       try {
         // Verified history package only: rejects tampered, missing-signature,
         // and legacy demo-placeholder packages with 404 (never serve them).
-        const story = await readVerifiedFollowedStory(storesRoot, backend, id, backend);
+        const story = await readVerifiedFollowedStory(storesRoot, backend, id, backend, { readerKey: readerKeyFor(req, backend) });
         send(res, 200, story);
       } catch {
         send(res, 404, { error: "not found" });
@@ -294,7 +304,7 @@ const server = http.createServer(async (req, res) => {
       // old shape. Falsy check covers cross-version missing/null markers.
       let story;
       try {
-        story = await readVerifiedFollowedStory(storesRoot, backend, id, backend);
+        story = await readVerifiedFollowedStory(storesRoot, backend, id, backend, { readerKey: readerKeyFor(req, backend) });
       } catch {
         send(res, 404, { error: "not found" });
         return;
@@ -395,6 +405,12 @@ const server = http.createServer(async (req, res) => {
         send(res, 400, { error: "can only post as the logged-in Kinfolk" });
         return;
       }
+      // M16 #116: encrypted by default; `public: true` opts out.
+      if (rec.public !== undefined && typeof rec.public !== "boolean") {
+        send(res, 400, { error: "public must be true or false" });
+        return;
+      }
+      const operatorKey = { readerKey: porchReaderKey(operatorPorch) };
       let validated;
       try {
         validated = validateInput({
@@ -407,12 +423,12 @@ const server = http.createServer(async (req, res) => {
         });
         // M15 #101: a comment names a post the operator can see; a wall
         // post names someone the operator follows. Fixed messages only.
-        await checkReplyTarget(storesRoot, operatorPorch, validated);
+        await checkReplyTarget(storesRoot, operatorPorch, validated, operatorKey);
       } catch (e) {
         send(res, 400, { error: (e as Error).message });
         return;
       }
-      const result = await publishStory(validated, backendsFromEnv(repoRoot));
+      const result = await publishStory(validated, backendsFromEnv(repoRoot), { public: rec.public === true });
       send(res, 201, result);
       return;
     }
@@ -452,7 +468,7 @@ const server = http.createServer(async (req, res) => {
       }
       // M15 #101: the operator hides, on their own porch only, someone
       // else's reply aimed at them. Nothing is changed on the author's porch.
-      const view = await readThreadedTimeline(storesRoot, operatorPorch, new Date().toISOString(), operatorPorch);
+      const view = await readThreadedTimeline(storesRoot, operatorPorch, new Date().toISOString(), operatorPorch, { readerKey: porchReaderKey(operatorPorch) });
       const target = hideableReply(view, input);
       if (!target) {
         send(res, 404, { error: "not found" });
@@ -581,9 +597,11 @@ const server = http.createServer(async (req, res) => {
     // Read-only package files so other OwnPlace instances can follow this
     // porch over https. Allowlist only: timeline.json (an untrusted id hint
     // for followers) and signed package files. contacts.json and anything
-    // else stay private. Sealed bodies stay sealed.
+    // else stay private. Sealed bodies stay sealed. M16 #116: keys.json (the
+    // epoch key wraps, which name no reader) is served so followers can open
+    // encrypted posts.
     if (req.method === "GET" && pathname.startsWith("/porch/")) {
-      const m = /^\/porch\/([^/]+)\/(timeline\.json|timeline\/([^/]+)\/([^/]+))$/.exec(pathname);
+      const m = /^\/porch\/([^/]+)\/(timeline\.json|keys\.json|timeline\/([^/]+)\/([^/]+))$/.exec(pathname);
       const backend = m?.[1] ?? "";
       const id = m?.[3];
       const file = m?.[4];

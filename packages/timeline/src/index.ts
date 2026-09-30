@@ -5,15 +5,29 @@
 // Slice-3 paid gating: gated packages also carry a signed entitlements.json
 // sidecar ({ storyId, entitled: [{ readerId }] }, ids only, no keys) bound by
 // the manifest hash plus Ed25519 signature; public posts carry no sidecar.
+// M16 #116: posts are encrypted by default (epoch key per author, wrapped to
+// the author and every mutual follow in keys.json); `public` opts out.
 
 import { randomBytes } from "node:crypto";
 import {
+  buildKeysFile,
+  canonicalJson,
   createManifest,
+  decryptContent,
+  encryptContent,
   hashObject,
+  isEncryptedContent,
+  isEncryptionPublicKey,
+  KEYS_FILE,
+  loadOrCreateEpochKey,
   loadOrCreateIdentity,
   signManifest,
+  unwrapEpochKey,
   verifyManifestSignature,
   objectBytes,
+  wrapEpochKey,
+  type EncryptedStory,
+  type EpochKey,
   type Kinfolk,
   type ReplyTarget,
   type Story,
@@ -47,6 +61,8 @@ export interface TimelineEntry {
   to?: WallTarget;
   inReplyTo?: ReplyTarget;
   sealed?: true;
+  // M16 #116: decrypted from an encrypted (Kinfolk-only) package.
+  encrypted?: true;
   // Set only by threadTimeline: verified comments, oldest first.
   comments?: TimelineEntry[];
 }
@@ -164,6 +180,13 @@ export const NO_PORCH = "author has no porch in this demo";
 
 export function demoKinfolkFor(authorId: string): DemoKinfolk | undefined {
   return DEMO_KINFOLK.find((k) => k.id === authorId);
+}
+
+// M16 #116: a demo porch is read as its owner, with the owner's X25519 key
+// from this machine's identity dir. Undefined for any other porch label.
+export function porchReaderKey(porch: string): string | undefined {
+  const owner = DEMO_KINFOLK.find((k) => k.porch === porch);
+  return owner ? loadOrCreateEncryptionIdentity(owner.id).privateKey : undefined;
 }
 
 // Library callers publishing as any other Kinfolk (tests, fixtures) get one
@@ -342,7 +365,7 @@ function collectHistoryProblems(parsed: Record<string, unknown>): string[] {
 // M13 #94: a pinned contact's porch served a package signed by another key.
 export const SIGNER_MISMATCH = "signer does not match followed creator";
 
-function signerMatches(pkg: VerifiedHistoryPackage, pin: string): boolean {
+function signerMatches(pkg: { kinfolk: Kinfolk }, pin: string): boolean {
   try {
     return identityFingerprint(pkg.kinfolk.publicKey ?? "") === pin;
   } catch {
@@ -367,6 +390,10 @@ export function toPublicSkipReason(rawReason: string): string {
       return kind;
     }
     if (part.includes(SIGNER_MISMATCH)) return SIGNER_MISMATCH;
+    // M16 #116: no reader key opens it (fixed line, no content), or its
+    // encrypted shape is wrong.
+    if (part === ENCRYPTED_POST) return ENCRYPTED_POST;
+    if (part.includes("encrypted")) return "malformed encrypted story";
     if (part.includes("package id mismatch")) return "package id mismatch";
     if (part.includes("hash mismatch")) {
       const m = part.match(/hash mismatch:\s*([A-Za-z0-9._-]+)/);
@@ -390,17 +417,37 @@ export function toPublicSkipReason(rawReason: string): string {
   return deduped.length ? deduped.join("; ") : "unverified package";
 }
 
-export interface VerifiedHistoryPackage {
+// M16 #116: a signed package whose story may still be encrypted. Signatures,
+// hashes and shape are checked; nothing is decrypted. Used where only the
+// signer matters (invites, key discovery) and before opening.
+export interface SignedHistoryPackage {
   kinfolk: Kinfolk;
-  story: Story;
+  story: Story | EncryptedStory;
   manifest: Record<string, unknown> & { packageId: string };
   signature: Record<string, unknown>;
   entitlements?: Entitlements;
 }
 
-// Verify one historical story package before display. Rejects missing or
-// tampered signatures and legacy demo-placeholder downgrades.
-export async function fetchVerifiedHistoryPackage(store: ObjectStore, id: string): Promise<VerifiedHistoryPackage> {
+export interface VerifiedHistoryPackage extends SignedHistoryPackage {
+  story: Story;
+  // M16 #116: the story was decrypted with the reader's key.
+  encrypted?: true;
+}
+
+// Fixed reason for an encrypted post the reader has no key for. Nothing
+// about the post (title, date, size) is reported.
+export const ENCRYPTED_POST = "encrypted post";
+
+const ENCRYPTED_STORY_FIELDS = ["authorId", "encrypted", "id"];
+
+// Verify one historical story package before display, then open it with the
+// reader's X25519 key if it is encrypted. Rejects missing or tampered
+// signatures and legacy demo-placeholder downgrades.
+export async function fetchVerifiedHistoryPackage(store: ObjectStore, id: string, readerKey?: string): Promise<VerifiedHistoryPackage> {
+  return openPackage(store, await fetchSignedPackage(store, id), id, readerKey);
+}
+
+export async function fetchSignedPackage(store: ObjectStore, id: string): Promise<SignedHistoryPackage> {
   if (!isSafeHistoryId(id)) throw new Error(`${id}: unsafe story id`);
   const parsed: Record<string, unknown> = {};
   const problems: string[] = [];
@@ -434,6 +481,13 @@ export async function fetchVerifiedHistoryPackage(store: ObjectStore, id: string
   }
   problems.push(...collectHistoryProblems(parsed));
   const storyDoc = parsed["story.json"] as { body?: unknown; restricted?: unknown } | undefined;
+  // M16 #116: an encrypted story carries its ids and the ciphertext, nothing
+  // else in the clear. A title, body, date or target beside it fails closed.
+  if (storyDoc && typeof storyDoc === "object" && Object.hasOwn(storyDoc, "encrypted")) {
+    if (!isEncryptedContent((storyDoc as { encrypted?: unknown }).encrypted)) problems.push("encrypted story is malformed");
+    const keys = Object.keys(storyDoc).sort();
+    if (keys.join(",") !== ENCRYPTED_STORY_FIELDS.join(",")) problems.push("encrypted package contains plaintext fields");
+  }
   if (storyDoc && storyDoc.restricted !== undefined) {
     if (!isSealedBody(storyDoc.restricted)) problems.push("gated envelope is malformed");
     else if (storyDoc.body !== "") problems.push("gated package contains plaintext body");
@@ -510,19 +564,90 @@ export async function fetchVerifiedHistoryPackage(store: ObjectStore, id: string
   if (problems.length) throw new Error(`${id}: ${problems.join("; ")}`);
   return {
     kinfolk: parsed["kinfolk.json"] as Kinfolk,
-    story: parsed["story.json"] as Story,
+    story: parsed["story.json"] as Story | EncryptedStory,
     manifest: parsed["manifest.json"] as VerifiedHistoryPackage["manifest"],
     signature: parsed["signature.json"] as Record<string, unknown>,
     ...(entitlementsDoc !== undefined ? { entitlements: entitlementsDoc as Entitlements } : {}),
   };
 }
 
+// M16 #116: one read's view of a porch's keys.json, and the epoch keys this
+// reader opened from it, so each story does not re-read or re-trial it.
+interface PorchKeys {
+  file?: Promise<unknown>;
+  epochs: Map<string, Buffer | undefined>;
+}
+
+function porchKeys(): PorchKeys {
+  return { epochs: new Map() };
+}
+
+async function epochKeyFor(store: ObjectStore, cache: PorchKeys, epoch: string, readerKey: string): Promise<Buffer | undefined> {
+  if (cache.epochs.has(epoch)) return cache.epochs.get(epoch);
+  cache.file ??= store.readObject(KEYS_FILE).then((b) => JSON.parse(new TextDecoder().decode(b)) as unknown, () => null);
+  const file = await cache.file;
+  let key: Buffer | undefined;
+  try {
+    key = unwrapEpochKey(file, epoch, readerKey);
+  } catch {
+    key = undefined;
+  }
+  cache.epochs.set(epoch, key);
+  return key;
+}
+
+// The decrypted payload is authored content: every field is checked again
+// before it can become a Story, and unknown fields fail closed.
+const PAYLOAD_FIELDS = new Set(["v", "title", "body", "media", "createdAt", "to", "inReplyTo"]);
+
+function storyFromPayload(text: string, doc: EncryptedStory): Story | undefined {
+  let p: Record<string, unknown>;
+  try {
+    p = JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+  if (!p || typeof p !== "object" || Array.isArray(p) || p.v !== 1) return undefined;
+  if (Object.keys(p).some((k) => !PAYLOAD_FIELDS.has(k))) return undefined;
+  if (typeof p.title !== "string" || typeof p.body !== "string" || !isMediaList(p.media)) return undefined;
+  if (typeof p.createdAt !== "string" || Number.isNaN(Date.parse(p.createdAt))) return undefined;
+  if (p.to !== undefined && !isWallTarget(p.to)) return undefined;
+  if (p.inReplyTo !== undefined && !isReplyTarget(p.inReplyTo)) return undefined;
+  if (p.to !== undefined && p.inReplyTo !== undefined) return undefined;
+  const story: Story = { id: doc.id, title: p.title, body: p.body, media: p.media, authorId: doc.authorId, createdAt: p.createdAt };
+  if (isWallTarget(p.to)) story.to = { fingerprint: p.to.fingerprint };
+  if (isReplyTarget(p.inReplyTo)) story.inReplyTo = { fingerprint: p.inReplyTo.fingerprint, storyId: p.inReplyTo.storyId };
+  return story;
+}
+
+// Plain packages pass through. An encrypted one opens only with a wrap for
+// this reader and an intact ciphertext; anything else is ENCRYPTED_POST.
+async function openPackage(
+  store: ObjectStore, pkg: SignedHistoryPackage, id: string, readerKey: string | undefined, cache: PorchKeys = porchKeys(),
+): Promise<VerifiedHistoryPackage> {
+  if (!Object.hasOwn(pkg.story, "encrypted")) return { ...pkg, story: pkg.story as Story };
+  const doc = pkg.story as EncryptedStory;
+  const locked = new Error(`${id}: ${ENCRYPTED_POST}`);
+  if (readerKey === undefined) throw locked;
+  const key = await epochKeyFor(store, cache, doc.encrypted.epoch, readerKey);
+  if (!key) throw locked;
+  let text: string;
+  try {
+    text = decryptContent(doc.encrypted, key, doc.authorId, doc.id);
+  } catch {
+    throw locked;
+  }
+  const story = storyFromPayload(text, doc);
+  if (!story) throw new Error(`${id}: malformed story fields`);
+  return { ...pkg, story, encrypted: true };
+}
+
 export function tryOpenStory(story: Story, readerPrivateKey?: string, readerId?: string) {
   return tryOpenBody(story, readerPrivateKey, readerId);
 }
 
-export async function readVerifiedHistoryStory(store: ObjectStore, id: string): Promise<Story> {
-  return (await fetchVerifiedHistoryPackage(store, id)).story;
+export async function readVerifiedHistoryStory(store: ObjectStore, id: string, readerKey?: string): Promise<Story> {
+  return (await fetchVerifiedHistoryPackage(store, id, readerKey)).story;
 }
 
 export async function rebuildIndex(store: ObjectStore, label: string): Promise<TimelineEntry[]> {
@@ -532,9 +657,12 @@ export async function rebuildIndex(store: ObjectStore, label: string): Promise<T
 // Authenticated timeline read: timeline.json is an untrusted cache hint and
 // is never used for display. Entries derive solely from verified history
 // packages; tampered, unsigned, or legacy-placeholder entries are skipped.
+// M16 #116: readerKey is the reader's X25519 private key (PEM). Without it,
+// or without a wrap for it, encrypted posts are skipped as ENCRYPTED_POST.
 export async function readAuthenticatedTimeline(
-  store: ObjectStore, label: string, now: string, pin?: string,
+  store: ObjectStore, label: string, now: string, pin?: string, readerKey?: string,
 ): Promise<{ index: TimelineIndex; skipped: { id: string; reason: string }[] }> {
+  const keys = porchKeys();
   const entries: TimelineEntry[] = [];
   const skipped: { id: string; reason: string }[] = [];
   let paths: string[] = [];
@@ -548,11 +676,12 @@ export async function readAuthenticatedTimeline(
   )];
   for (const id of ids) {
     try {
-      const pkg = await fetchVerifiedHistoryPackage(store, id);
-      if (pin !== undefined && !signerMatches(pkg, pin)) {
+      const signed = await fetchSignedPackage(store, id);
+      if (pin !== undefined && !signerMatches(signed, pin)) {
         skipped.push({ id, reason: `${id}: ${SIGNER_MISMATCH}` });
         continue;
       }
+      const pkg = await openPackage(store, signed, id, readerKey, keys);
       const story = pkg.story as Partial<Story>;
       if (typeof story?.id === "string" && typeof story?.title === "string" &&
           typeof story?.authorId === "string" && typeof story?.createdAt === "string" &&
@@ -570,8 +699,12 @@ export async function readAuthenticatedTimeline(
     }
   }
   sortTimeline(entries);
+  // M16 #116: posts this reader has no key for are not "unverified".
+  const locked = skipped.filter((s) => s.reason === `${s.id}: ${ENCRYPTED_POST}`).length;
+  const unverified = skipped.length - locked;
   if (skipped.length > 0) {
-    console.log(`rebuilt ${label} index from ${entries.length} verified on-disk ${entries.length === 1 ? "story" : "stories"} (${skipped.length} unverified skipped)`);
+    const notes = [unverified ? `${unverified} unverified skipped` : "", locked ? `${locked} encrypted, not opened` : ""].filter(Boolean).join(", ");
+    console.log(`rebuilt ${label} index from ${entries.length} verified on-disk ${entries.length === 1 ? "story" : "stories"} (${notes})`);
   } else if (entries.length > 0) {
     console.log(`rebuilt ${label} index from ${entries.length} on-disk ${entries.length === 1 ? "story" : "stories"}`);
   }
@@ -595,6 +728,7 @@ function entryFor(pkg: VerifiedHistoryPackage, id: string): TimelineEntry {
   if (story.to) entry.to = { fingerprint: story.to.fingerprint };
   if (story.inReplyTo) entry.inReplyTo = { fingerprint: story.inReplyTo.fingerprint, storyId: story.inReplyTo.storyId };
   if (story.restricted !== undefined) entry.sealed = true;
+  if (pkg.encrypted) entry.encrypted = true;
   return entry;
 }
 
@@ -623,7 +757,7 @@ export function isPorchLabel(label: unknown): label is string {
 }
 
 export async function readFollowedTimelines(
-  porches: FollowedPorch[], now: string,
+  porches: FollowedPorch[], now: string, readerKey?: string,
 ): Promise<{ stories: TimelineEntry[]; skipped: { porch: string; id: string; reason: string }[] }> {
   const seen = new Set<string>();
   const stories: TimelineEntry[] = [];
@@ -642,7 +776,7 @@ export async function readFollowedTimelines(
       // missing local folder). A remote porch that is down must show as
       // unreadable instead, so list first. Local listing never throws.
       await porch.store.listObjects("timeline/");
-      read = await readAuthenticatedTimeline(porch.store, porch.label, now, porch.pin);
+      read = await readAuthenticatedTimeline(porch.store, porch.label, now, porch.pin, readerKey);
     } catch {
       // One broken porch (store fault, unexpected throw) loses its own
       // entries but never the whole merged read.
@@ -739,6 +873,9 @@ interface ResolvedPorch {
 export interface FollowOptions {
   // Test seam for remote porches; production uses the global fetch.
   fetch?: (input: string, init?: RequestInit) => Promise<Response>;
+  // M16 #116: the reader's X25519 private key (PEM), used to open encrypted
+  // posts. Without it they are left out of the read.
+  readerKey?: string;
 }
 
 async function resolveContactPorches(
@@ -862,9 +999,9 @@ async function readContactFollowed(
 ): Promise<{ stories: TimelineEntry[]; skipped: { porch: string; id: string; reason: string }[]; contactsStore: ObjectStore | null }> {
   const { porches, skipped, contactsStore } = await resolveContactPorches(storesRoot, ownLabel, contactsLabel, opts);
   const toFollowed = () => porches.map((porch) => ({ label: porch.label, store: porch.store, pin: porch.pin }));
-  let merged = await readFollowedTimelines(toFollowed(), now);
+  let merged = await readFollowedTimelines(toFollowed(), now, opts.readerKey);
   if (await followMovedPorches(porches, merged, contactsStore, opts)) {
-    merged = await readFollowedTimelines(toFollowed(), now);
+    merged = await readFollowedTimelines(toFollowed(), now, opts.readerKey);
   }
   return { stories: merged.stories, skipped: [...skipped, ...merged.skipped], contactsStore };
 }
@@ -1065,10 +1202,10 @@ export async function readVerifiedFollowedStory(
     const prefix = `timeline/${id}`;
     const owns = listed.some((p) => p === prefix || p.startsWith(prefix + "/"));
     if (!owns) continue;
-    const pkg = await fetchVerifiedHistoryPackage(porch.store, id);
+    const signed = await fetchSignedPackage(porch.store, id);
     // The owning porch keeps the id even on a signer mismatch: no fall-through.
-    if (porch.pin && !signerMatches(pkg, porch.pin)) throw new Error("not found");
-    return pkg.story;
+    if (porch.pin && !signerMatches(signed, porch.pin)) throw new Error("not found");
+    return (await openPackage(porch.store, signed, id, opts.readerKey)).story;
   }
   throw new Error("not found");
 }
@@ -1086,9 +1223,11 @@ export interface EntitleReader {
 
 export const SEALED_REPLY = "comments and wall posts are public in this slice";
 
-export function buildPackage(input: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string; createdAt: string; storyId: string; to?: WallTarget; inReplyTo?: ReplyTarget }, opts: { entitle?: EntitleReader; entitleReaders?: EntitleReader[] } = {}) {
+export function buildPackage(input: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string; createdAt: string; storyId: string; to?: WallTarget; inReplyTo?: ReplyTarget }, opts: { entitle?: EntitleReader; entitleReaders?: EntitleReader[]; encrypt?: EpochKey } = {}) {
   const identity = loadOrCreateIdentity(input.authorId);
   const kinfolk: Kinfolk = { id: input.authorId, displayName: input.authorName, publicKey: identity.publicKey };
+  // M16 #116: the signed X25519 key a mutual follow wraps epoch keys to.
+  kinfolk.encryptionKey = loadOrCreateEncryptionIdentity(input.authorId).publicKey;
   // M15 #100: the seed publisher signs the bio the invite panel shows.
   if (input.authorBio) kinfolk.bio = input.authorBio;
   const story: Story = {
@@ -1105,6 +1244,7 @@ export function buildPackage(input: { title: string; body: string; media?: strin
   if (input.inReplyTo) story.inReplyTo = { fingerprint: input.inReplyTo.fingerprint, storyId: input.inReplyTo.storyId };
   const readers: EntitleReader[] = [...(opts.entitleReaders ?? []), ...(opts.entitle ? [opts.entitle] : [])];
   if (readers.length > 0 && (story.to || story.inReplyTo)) throw new Error(SEALED_REPLY);
+  if (readers.length > 0 && opts.encrypt) throw new Error("a post is either paid-gated or encrypted, not both");
   // M4 cross-check + Slice-3 sidecar (ids only, no keys/secrets). Signed via
   // the manifest like kinfolk/story so readers can discover entitlement
   // without trial-decrypt. Combine legacy `entitle` + batch `entitleReaders`
@@ -1125,9 +1265,11 @@ export function buildPackage(input: { title: string; body: string; media?: strin
     const sealed = story.restricted as { wrapped: { readerId: string }[] };
     entitlements = { storyId: input.storyId, entitled: sealed.wrapped.map((w) => ({ readerId: w.readerId })) };
   }
+  // M16 #116: everything but the ids goes inside the ciphertext.
+  const storyDoc: Story | EncryptedStory = opts.encrypt ? encryptStory(story, input.media ?? [], opts.encrypt) : story;
   const manifest = createManifest(input.storyId, [
     { path: "kinfolk.json", contentType: "application/json", value: kinfolk },
-    { path: "story.json", contentType: "application/json", value: story },
+    { path: "story.json", contentType: "application/json", value: storyDoc },
     ...(entitlements
       ? [{ path: ENTITLEMENTS_FILE, contentType: "application/json", value: entitlements }]
       : []),
@@ -1135,33 +1277,111 @@ export function buildPackage(input: { title: string; body: string; media?: strin
   const signature = signManifest(manifest, identity.privateKey);
   const files: Record<string, Uint8Array> = {
     "kinfolk.json": objectBytes(kinfolk),
-    "story.json": objectBytes(story),
+    "story.json": objectBytes(storyDoc),
     ...(entitlements ? { [ENTITLEMENTS_FILE]: objectBytes(entitlements) } : {}),
     "manifest.json": objectBytes(manifest),
     "signature.json": objectBytes(signature),
   };
+  // `story` is the authored story in memory; `files` hold what is published.
   return { kinfolk, story, manifest, signature, files, ...(entitlements ? { entitlements } : {}) };
 }
 
-export function makeStoryId(now: string): string {
-  return `story-${now.slice(0, 10)}-${randomBytes(4).toString("hex")}`;
+function encryptStory(story: Story, media: string[], epoch: EpochKey): EncryptedStory {
+  const payload: Record<string, unknown> = { v: 1, title: story.title, body: story.body, media, createdAt: story.createdAt };
+  if (story.to) payload.to = story.to;
+  if (story.inReplyTo) payload.inReplyTo = story.inReplyTo;
+  return { id: story.id, authorId: story.authorId, encrypted: encryptContent(canonicalJson(payload), epoch, story.authorId, story.id) };
+}
+
+// M16 #116: opaque ids. 128 random bits, no date or title in the path.
+export function makeStoryId(): string {
+  return `story-${randomBytes(16).toString("hex")}`;
+}
+
+// --- Encrypted by default (M16 #116) ---
+// Readers of an author's epoch key: the author and every mutual follow. A
+// mutual follow is a pinned contact whose own porch pins the author back.
+// Only local: porches can show that (contacts.json is never served), so
+// https follows wait for slice 2's follow requests. Each reader's X25519
+// key comes from a package on their porch that verifies against the pin,
+// never from an unsigned file.
+async function pinnedEncryptionKey(store: ObjectStore, pin: string): Promise<string | undefined> {
+  let ids: string[];
+  try {
+    ids = [...new Set((await store.listObjects("timeline/")).map((p) => p.split("/")[1]).filter(Boolean))].sort();
+  } catch {
+    return undefined;
+  }
+  for (const id of ids) {
+    try {
+      const pkg = await fetchSignedPackage(store, id);
+      if (signerMatches(pkg, pin) && isEncryptionPublicKey(pkg.kinfolk.encryptionKey)) return pkg.kinfolk.encryptionKey;
+    } catch {
+      // Unverified package: never a source of keys.
+    }
+  }
+  return undefined;
+}
+
+async function mutualReaderKeys(storesRoot: string, porch: string, authorFingerprint: string): Promise<string[]> {
+  let porches: ResolvedPorch[];
+  try {
+    ({ porches } = await resolveContactPorches(storesRoot, porch, porch));
+  } catch {
+    return [];
+  }
+  const keys: string[] = [];
+  for (const p of porches) {
+    if (!p.pin || p.pin === authorFingerprint || p.path.startsWith("remote:")) continue;
+    const followsBack = (await readContacts(p.store)).contacts.some((c) => c.fingerprint === authorFingerprint);
+    if (!followsBack) continue;
+    const key = await pinnedEncryptionKey(p.store, p.pin);
+    if (key) keys.push(key);
+  }
+  return keys;
+}
+
+async function keysFileBytes(storesRoot: string, porch: string, authorId: string, epoch: EpochKey): Promise<Uint8Array> {
+  const own = loadOrCreateEncryptionIdentity(authorId).publicKey;
+  const fingerprint = identityFingerprint(loadOrCreateIdentity(authorId).publicKey);
+  const readers = [own, ...(await mutualReaderKeys(storesRoot, porch, fingerprint))];
+  return objectBytes(buildKeysFile([wrapEpochKey(epoch, readers)]));
+}
+
+// timeline.json is an unsigned hint naming which ids a follower should
+// fetch. Public posts keep their clear metadata. Encrypted posts are bare
+// ids in id order, so the hint shows no title, date or order for them, and
+// the file carries no updatedAt.
+export interface TimelineHint {
+  protocol: "rooted/v0.1";
+  kind: "timeline";
+  stories: (TimelineEntry | { id: string })[];
+}
+
+async function buildTimelineHint(store: ObjectStore, label: string, now: string): Promise<TimelineHint> {
+  const read = await readAuthenticatedTimeline(store, label, now);
+  const encrypted = read.skipped
+    .filter((s) => s.reason === `${s.id}: ${ENCRYPTED_POST}`)
+    .map((s) => ({ id: s.id }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  return { protocol: "rooted/v0.1", kind: "timeline", stories: [...read.index.stories, ...encrypted] };
+}
+
+function hintBytes(hint: TimelineHint): Uint8Array {
+  return new TextEncoder().encode(`${JSON.stringify(hint)}\n`);
 }
 
 async function publishToTimeline(
   label: string,
   store: ObjectStore,
   storyId: string,
-  story: Story,
   files: Record<string, Uint8Array>,
-  now: string
+  now: string,
+  keysFile?: Uint8Array,
 ): Promise<void> {
-  const index = await readIndex(store, label, now);
-  if (!index.stories.some((s) => s.id === storyId)) {
-    index.stories.push({ id: storyId, title: story.title, authorId: story.authorId, createdAt: now, verified: true });
-  }
-  sortTimeline(index.stories);
-  index.updatedAt = now;
-  const indexBytes = new TextEncoder().encode(`${JSON.stringify(index)}\n`);
+  // M16 #116: wraps before the post they open, so a reader never sees a post
+  // whose epoch has no wrap for them yet.
+  if (keysFile) await store.writeObject(KEYS_FILE, keysFile);
   // History first, then flat latest copy, then the index last: a crash can
   // only leave the index behind the data, never ahead of it.
   for (const [name, bytes] of Object.entries(files)) {
@@ -1177,7 +1397,7 @@ async function publishToTimeline(
   if (!(ENTITLEMENTS_FILE in files)) {
     await store.deleteObject(ENTITLEMENTS_FILE);
   }
-  await store.writeObject("timeline.json", indexBytes);
+  await store.writeObject("timeline.json", hintBytes(await buildTimelineHint(store, label, now)));
   console.log(`posted ${storyId} to ${label} (timeline + latest)`);
 }
 
@@ -1208,35 +1428,28 @@ export function backendsFromEnv(repoRoot: string): BackendSet {
   return out;
 }
 
-/** Publish one validated story to its author's porch and that porch's cloud. */
-export async function publishStory(
-  validated: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string; to?: WallTarget; inReplyTo?: ReplyTarget },
+type Home = Pick<DemoKinfolk, "porch" | "cloud">;
+
+// Writes to the author's porch, then to that porch's one cloud when enabled.
+// Google Drive gets a copy of the whole porch folder.
+async function writeToPorchAndCloud(
+  home: Home,
   backends: BackendSet,
-  opts: { createdAt?: string; storyId?: string; entitle?: EntitleReader; entitleReaders?: EntitleReader[]; membersOnly?: boolean } = {}
-): Promise<PublishResult> {
-  // M15 #100: one Kinfolk, one porch (and that porch's cloud only).
-  const home = demoKinfolkFor(validated.authorId) ?? DEFAULT_PORCH;
-  const now = opts.createdAt ?? new Date().toISOString();
-  const storyId = opts.storyId ?? makeStoryId(now);
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(storyId)) throw new Error("unsafe story id");
-  const entitleReaders = await mergeSubscriberReaders(backends, opts, validated.authorId, home.porch);
-  const { files, story } = buildPackage({ ...validated, createdAt: now, storyId }, entitleReaders.length ? { entitleReaders } : {});
+  what: string,
+  write: (label: string, store: ObjectStore) => Promise<void>,
+): Promise<{ backends: string[]; skipped: string[] }> {
   const published: string[] = [];
   const skipped: string[] = [];
 
   const dir = resolve(backends.root, home.porch);
   await mkdir(dir, { recursive: true });
-  await publishToTimeline(home.porch, new LocalFolderStore(dir), storyId, story, files, now);
+  await write(home.porch, new LocalFolderStore(dir));
   published.push(home.porch);
 
   if (home.cloud !== "kevcloud") {
     skipped.push("kevcloud");
   } else if (backends.kevcloud) {
-    await publishToTimeline(
-      "kevcloud (WebDAV)",
-      new WebDavStore({ ...backends.kevcloud }),
-      storyId, story, files, now
-    );
+    await write("kevcloud (WebDAV)", new WebDavStore({ ...backends.kevcloud }));
     published.push("kevcloud");
   } else {
     skipped.push("kevcloud");
@@ -1249,14 +1462,52 @@ export async function publishStory(
     const src = resolve(backends.root, home.porch) + "/";
     await run("rclone", ["copy", src, `${backends.drive.remote}${backends.drive.folder}/`, "--timeout", "30s"],
       { timeout: 90000 });
-    console.log(`posted ${storyId} to google-drive (rclone ${backends.drive.remote}${backends.drive.folder}/)`);
+    console.log(`posted ${what} to google-drive (rclone ${backends.drive.remote}${backends.drive.folder}/)`);
     published.push("google-drive");
   } else {
     skipped.push("google-drive");
     console.log("skip google-drive: GOOGLE_DRIVE_SYNC!=1");
   }
+  return { backends: published, skipped };
+}
 
-  return { storyId, authorId: validated.authorId, backends: published, skipped };
+/** Publish one validated story to its author's porch and that porch's cloud. */
+// M16 #116: encrypted unless `public`. Paid-gated posts (entitle,
+// entitleReaders, membersOnly) keep the slice-2 sealed body and clear title.
+export async function publishStory(
+  validated: { title: string; body: string; media?: string[]; authorId: string; authorName: string; authorBio?: string; to?: WallTarget; inReplyTo?: ReplyTarget },
+  backends: BackendSet,
+  opts: { createdAt?: string; storyId?: string; entitle?: EntitleReader; entitleReaders?: EntitleReader[]; membersOnly?: boolean; public?: boolean } = {}
+): Promise<PublishResult> {
+  // M15 #100: one Kinfolk, one porch (and that porch's cloud only).
+  const home = demoKinfolkFor(validated.authorId) ?? DEFAULT_PORCH;
+  const now = opts.createdAt ?? new Date().toISOString();
+  const storyId = opts.storyId ?? makeStoryId();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(storyId)) throw new Error("unsafe story id");
+  const entitleReaders = await mergeSubscriberReaders(backends, opts, validated.authorId, home.porch);
+  const encrypt = entitleReaders.length === 0 && opts.public !== true;
+  const epoch = encrypt ? loadOrCreateEpochKey(validated.authorId) : undefined;
+  const { files } = buildPackage(
+    { ...validated, createdAt: now, storyId },
+    entitleReaders.length ? { entitleReaders } : epoch ? { encrypt: epoch } : {},
+  );
+  const keysFile = epoch ? await keysFileBytes(backends.root, home.porch, validated.authorId, epoch) : undefined;
+  const res = await writeToPorchAndCloud(home, backends, storyId, (label, store) =>
+    publishToTimeline(label, store, storyId, files, now, keysFile));
+  return { storyId, authorId: validated.authorId, ...res };
+}
+
+// M16 #116: re-wrap the author's epoch key to the author and their current
+// mutual follows. A new mutual can then read every post in the epoch (#115
+// Q1). `npm run publish` calls this once both demo Kinfolk have posted.
+export async function refreshKeyWraps(authorId: string, backends: BackendSet): Promise<PublishResult> {
+  const home = demoKinfolkFor(authorId) ?? DEFAULT_PORCH;
+  const bytes = await keysFileBytes(backends.root, home.porch, authorId, loadOrCreateEpochKey(authorId));
+  const res = await writeToPorchAndCloud(home, backends, KEYS_FILE, async (label, store) => {
+    await store.writeObject(KEYS_FILE, bytes);
+    console.log(`wrapped ${authorId}'s epoch key on ${label}`);
+  });
+  return { storyId: "", authorId, ...res };
 }
 
 // --- Deleting a reply (M15 #101) ---
@@ -1266,11 +1517,12 @@ export async function publishStory(
 // posts are not deletable in this slice.
 export const DELETE_REFUSED = { missing: "not found", notReply: "only comments and wall posts can be deleted" } as const;
 
-async function removeFromTimeline(label: string, store: ObjectStore, storyId: string, now: string): Promise<void> {
+async function removeFromTimeline(label: string, store: ObjectStore, storyId: string, now: string, readerKey: string): Promise<void> {
   for (const name of KNOWN_PACKAGE_FILES) await store.deleteObject(`timeline/${storyId}/${name}`);
   // The flat "latest" copy must not keep the deleted words: point it at the
-  // newest remaining package, or clear it when none is left.
-  const index = await readIndex(store, label, now);
+  // newest remaining package, or clear it when none is left. M16 #116: the
+  // author's own key dates their encrypted posts.
+  const index = (await readAuthenticatedTimeline(store, label, now, undefined, readerKey)).index;
   let flatId: unknown;
   try {
     flatId = (JSON.parse(new TextDecoder().decode(await store.readObject("story.json"))) as { id?: unknown }).id;
@@ -1292,7 +1544,7 @@ async function removeFromTimeline(label: string, store: ObjectStore, storyId: st
       else await store.deleteObject(name);
     }
   }
-  await store.writeObject("timeline.json", new TextEncoder().encode(`${JSON.stringify(index)}\n`));
+  await store.writeObject("timeline.json", hintBytes(await buildTimelineHint(store, label, now)));
   console.log(`deleted ${storyId} from ${label}`);
 }
 
@@ -1307,8 +1559,11 @@ export async function deleteReply(
   const now = opts.now ?? new Date().toISOString();
   const store = new LocalFolderStore(resolve(backends.root, home.porch));
   let pkg: VerifiedHistoryPackage;
+  let readerKey: string;
   try {
-    pkg = await fetchVerifiedHistoryPackage(store, storyId);
+    // M16 #116: the author opens their own encrypted reply to check it.
+    readerKey = loadOrCreateEncryptionIdentity(authorId).privateKey;
+    pkg = await fetchVerifiedHistoryPackage(store, storyId, readerKey);
   } catch {
     throw new Error(DELETE_REFUSED.missing);
   }
@@ -1319,11 +1574,11 @@ export async function deleteReply(
   if (!pkg.story.to && !pkg.story.inReplyTo) throw new Error(DELETE_REFUSED.notReply);
   const published: string[] = [];
   const skipped: string[] = [];
-  await removeFromTimeline(home.porch, store, storyId, now);
+  await removeFromTimeline(home.porch, store, storyId, now, readerKey);
   published.push(home.porch);
 
   if (home.cloud === "kevcloud" && backends.kevcloud) {
-    await removeFromTimeline("kevcloud (WebDAV)", new WebDavStore({ ...backends.kevcloud }), storyId, now);
+    await removeFromTimeline("kevcloud (WebDAV)", new WebDavStore({ ...backends.kevcloud }), storyId, now, readerKey);
     published.push("kevcloud");
   } else {
     skipped.push("kevcloud");
@@ -1657,9 +1912,10 @@ export async function resolveInvite(inviteUrl: string, opts: FollowOptions = {})
     throw new Error("invite porch could not be read");
   }
   for (const id of ids) {
-    let pkg: VerifiedHistoryPackage;
+    // M16 #116: only the signer matters here, so encrypted posts count too.
+    let pkg: SignedHistoryPackage;
     try {
-      pkg = await fetchVerifiedHistoryPackage(porch, id);
+      pkg = await fetchSignedPackage(porch, id);
     } catch {
       continue;
     }
