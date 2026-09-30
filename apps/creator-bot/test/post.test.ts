@@ -318,6 +318,39 @@ test("post refuses to start with an invalid OWNPLACE_OPERATOR_ID and writes noth
   }
 });
 
+// M15 #113: a mistyped flag must not silently post as the operator.
+test("post refuses unknown flags and stray arguments with usage and writes nothing (#113)", async () => {
+  const tmp = await mkdtemp(join(tmpdir(), "rooted-post-"));
+  const env = { OWNPLACE_IDENTITY_DIR: join(tmp, "ids") };
+  try {
+    const cases: [string[], RegExp][] = [
+      [["--author", "kinfolk-sam", "--title", "t", "--body", "b"], /post failed: unknown flag: --author\n/],
+      [["--title", "t", "--body", "b", "--author-id=kinfolk-sam"], /post failed: unknown flag: --author-id=kinfolk-sam\n/],
+      [["--title", "t", "--body", "b", "--members-only", "--members"], /post failed: unknown flag: --members\n/],
+      [["--title", "t", "--body", "two", "words"], /post failed: unexpected argument: words\n/],
+      // --public is a boolean flag: it must not swallow a stray argument.
+      [["--title", "t", "--body", "b", "--public", "extra"], /post failed: unexpected argument: extra\n/],
+    ];
+    for (const [args, message] of cases) {
+      await assert.rejects(runPost(tmp, args, env),
+        (e: { code?: number; stderr?: string }) => e.code === 2 && message.test(e.stderr ?? "") && /usage: npm run post/.test(e.stderr ?? ""));
+    }
+    await assert.rejects(access(join(tmp, "nextcloud-sim")), "a refused post writes nothing to the operator's porch");
+    await assert.rejects(access(join(tmp, "google-drive-sim")), "a refused post writes nothing to Sam's porch");
+    // Every documented flag is still accepted.
+    const { stdout } = await runPost(tmp, ["--title", "t", "--body", "b", "--author-id", "kinfolk-alex", "--author-name", "Alex", "--members-only"], env);
+    assert.match(stdout, /done: nextcloud-sim .*author=kinfolk-alex/);
+    // M16 #116's --public is accepted and still writes the plaintext format.
+    const pub = await runPost(tmp, ["--public", "--title", "Open", "--body", "for everyone"], env);
+    const id = (pub.stdout.match(/story=\S+/) ?? [""])[0].replace("story=", "").trim();
+    const story = await readJson(tmp, "nextcloud-sim", "timeline", id, "story.json");
+    assert.equal(story.body, "for everyone");
+    assert.equal(story.encrypted, undefined);
+  } finally {
+    await rm(tmp, { recursive: true, force: true });
+  }
+});
+
 // M16 #116: --public writes today's signed plaintext format; it cannot be
 // combined with paid gating.
 test("post --public writes the signed plaintext format", async () => {
